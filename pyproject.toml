@@ -15,10 +15,14 @@ classifiers = [
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
 ]
-# Pinned to the minor: the module imports private helpers from
-# arches.app.etl_modules.save. The lower bound names an alpha because coral
-# runs 8.2.0a8, and under PEP 440 "8.2" would exclude every 8.2.0aN.
-dependencies = ["arches>=8.2.0a1,<8.3"]
+# Deliberately empty. An Arches application is only ever installed into a
+# project that already pins arches itself -- coral pins arches==8.2.0a8 and
+# installs it from a local checkout, not from an index -- so any specifier here
+# can only conflict with that pin, never usefully constrain it. "arches>=8.2"
+# did exactly that: under PEP 440 an alpha sorts below its release, so 8.2.0a8
+# failed the bound and pip went looking for an arches on PyPI that does not
+# exist. The real version coupling is documented in the README.
+dependencies = []
 
 [project.urls]
 Repository = "https://github.com/flaxandteal/arches-json-importer"
