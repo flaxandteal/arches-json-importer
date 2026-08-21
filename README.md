@@ -51,11 +51,14 @@ Postgres function and registers the ETL module, which then appears under
 
 ## Version coupling
 
-Pinned to `arches>=8.2,<8.3`. The module imports
+Pinned to `arches>=8.2.0a1,<8.3` (the alpha lower bound matters: under PEP 440
+`arches>=8.2` would exclude `8.2.0a8`, which is what coral runs). The module imports
 `_post_save_edit_log`, `disable_tile_triggers` and `reenable_tile_triggers` from
-`arches.app.etl_modules.save` — the first is private — and its migration depends
-on core's `models.12778_add_loadstaging_index`. Both need rechecking against any
-new Arches minor.
+`arches.app.etl_modules.save` — the first is private. That needs rechecking
+against any new Arches minor. The migration deliberately depends on the old
+`models.9558_add_plugin_help` (the last core migration touching the ETLModule
+columns it writes) rather than on whatever core migration is newest, so
+installing does not pin a patch release.
 
 ## Tests
 

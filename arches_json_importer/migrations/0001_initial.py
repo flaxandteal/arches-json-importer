@@ -132,7 +132,11 @@ class Migration(migrations.Migration):
     initial = True
 
     dependencies = [
-        ("models", "12778_add_loadstaging_index"),
+        # The last core migration that changes anything this one writes:
+        # ETLModule.helptemplate and .helpsortorder. Deliberately not the
+        # latest core migration -- depending on that would pin the application
+        # to a single Arches patch release for no gain.
+        ("models", "9558_add_plugin_help"),
     ]
 
     operations = [

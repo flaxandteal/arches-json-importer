@@ -16,9 +16,9 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 # Pinned to the minor: the module imports private helpers from
-# arches.app.etl_modules.save and depends on core migration
-# 12778_add_loadstaging_index.
-dependencies = ["arches>=8.2,<8.3"]
+# arches.app.etl_modules.save. The lower bound names an alpha because coral
+# runs 8.2.0a8, and under PEP 440 "8.2" would exclude every 8.2.0aN.
+dependencies = ["arches>=8.2.0a1,<8.3"]
 
 [project.urls]
 Repository = "https://github.com/flaxandteal/arches-json-importer"
