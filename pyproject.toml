@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arches-json-importer"
+version = "0.1.0"
+description = "Bulk import of Arches JSON business data through the ETL loader"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "AGPL-3.0-or-later"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: Django",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+]
+# Pinned to the minor: the module imports private helpers from
+# arches.app.etl_modules.save and depends on core migration
+# 12778_add_loadstaging_index.
+dependencies = ["arches>=8.2,<8.3"]
+
+[project.urls]
+Repository = "https://github.com/flaxandteal/arches-json-importer"
+
+[tool.setuptools]
+packages = [
+    "arches_json_importer",
+    "arches_json_importer.etl_modules",
+    "arches_json_importer.migrations",
+]
+
+[tool.setuptools.package-data]
+arches_json_importer = [
+    "templates/**/*.htm",
+    "media/js/**/*.js",
+    "migrations/sql/**/*.sql",
+]
