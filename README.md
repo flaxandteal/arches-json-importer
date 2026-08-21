@@ -51,9 +51,10 @@ Postgres function and registers the ETL module, which then appears under
 
 ## Version coupling
 
-Tested against Arches 8.2. **No `arches` pin is declared** — the host project
-already pins it, and a specifier here can only fight that pin (see the comment
-in `pyproject.toml`). Treat 8.2 as the supported minor. The module imports
+Pinned to `arches>=8.2.0a1,<8.3`. Both halves matter and the comment in
+`pyproject.toml` says why: Arches' own system check requires every application
+to declare an `arches` requirement, and the alpha in the lower bound is what
+lets `8.2.0a8` satisfy it. The module imports
 `_post_save_edit_log`, `disable_tile_triggers` and `reenable_tile_triggers` from
 `arches.app.etl_modules.save` — the first is private. That needs rechecking
 against any new Arches minor. The migration deliberately depends on the old

@@ -15,14 +15,18 @@ classifiers = [
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
 ]
-# Deliberately empty. An Arches application is only ever installed into a
-# project that already pins arches itself -- coral pins arches==8.2.0a8 and
-# installs it from a local checkout, not from an index -- so any specifier here
-# can only conflict with that pin, never usefully constrain it. "arches>=8.2"
-# did exactly that: under PEP 440 an alpha sorts below its release, so 8.2.0a8
-# failed the bound and pip went looking for an arches on PyPI that does not
-# exist. The real version coupling is documented in the README.
-dependencies = []
+# The arches requirement is mandatory and its exact form matters. Arches' own
+# system check (check_arches_compatibility in arches/apps.py) calls
+# importlib.metadata.requires() on every arches application; with no
+# dependencies it gets None and falls back to reading a pyproject.toml next to
+# the installed package, which does not exist in a wheel -- a hard
+# FileNotFoundError at startup.
+#
+# The alpha in the lower bound is equally load-bearing. Under PEP 440 an alpha
+# sorts below its release, so "arches>=8.2" rejects the 8.2.0a8 that coral
+# runs -- twice over: pip cannot resolve it, and SpecifierSet only considers
+# prereleases at all when the specifier itself names one.
+dependencies = ["arches>=8.2.0a1,<8.3"]
 
 [project.urls]
 Repository = "https://github.com/flaxandteal/arches-json-importer"
