@@ -21,7 +21,21 @@ def load_arches_json(userid, files, summary, result, temp_dir, loadid, moduleid)
         )
         importer.userid = userid
         importer.moduleid = moduleid
-        importer.run_load_task(userid, files, summary, result, temp_dir, loadid)
+        # Indexing is the long pole once the tiles are written, and it is
+        # CPU-bound in Python (nested doc + term building), not in ES -- a
+        # single process pegs one core of the box.  index_resources_by_transaction
+        # fans out over ceil(cpu_count()/2) subprocesses when asked; max_subprocesses=0
+        # means "use that default".
+        importer.run_load_task(
+            userid,
+            files,
+            summary,
+            result,
+            temp_dir,
+            loadid,
+            multiprocessing=True,
+            max_subprocesses=0,
+        )
 
         load_event = models.LoadEvent.objects.get(loadid=loadid)
         status = _("Completed") if load_event.status == "indexed" else _("Failed")
