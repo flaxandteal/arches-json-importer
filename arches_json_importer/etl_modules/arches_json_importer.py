@@ -38,7 +38,7 @@ import logging
 import os
 import uuid
 import zipfile
-from datetime import datetime
+from django.utils import timezone
 from pathlib import Path
 
 from django.contrib.auth.models import User
@@ -146,7 +146,7 @@ class ArchesJsonImporter(BaseImportModule):
             etl_module_id=self.moduleid,
             complete=False,
             status="running",
-            load_start_time=datetime.now(),
+            load_start_time=timezone.now(),
             user_id=self.userid,
             load_details={"config": options},
         )
@@ -849,7 +849,7 @@ class ArchesJsonImporter(BaseImportModule):
         except Exception as e:
             logger.exception(e)
             LoadEvent.objects.filter(loadid=loadid).update(
-                status="failed", load_end_time=datetime.now()
+                status="failed", load_end_time=timezone.now()
             )
             return {
                 "status": 400,
@@ -860,7 +860,18 @@ class ArchesJsonImporter(BaseImportModule):
         finally:
             self._release_trigger_lock(cursor)
 
-        return _post_save_edit_log(userid, loadid, multiprocessing, max_subprocesses)
+        response = _post_save_edit_log(userid, loadid, multiprocessing, max_subprocesses)
+
+        # _post_save_edit_log stamps its finishing time through raw SQL with a
+        # naive datetime.now(), so DateTimeField.get_prep_value never runs and
+        # Postgres casts the bare timestamp under the session TimeZone -- UTC,
+        # because USE_TZ is on -- while load_start_time went through the ORM and
+        # was localised to TIME_ZONE.  An hour apart under BST, which shows up as
+        # an indexing duration an hour too long.  Re-stamp with an aware value:
+        # it lands within a second of what core wrote, and needs no core patch.
+        stamped = "indexed_time" if response.get("data") == "indexed" else "load_end_time"
+        LoadEvent.objects.filter(loadid=loadid).update(**{stamped: timezone.now()})
+        return response
 
     def _iter_resource_chunks(self, chunk_size):
         """Re-read the source, yielding whole resources in chunks.
@@ -881,7 +892,7 @@ class ArchesJsonImporter(BaseImportModule):
             yield chunk
 
     def _write_chunk(self, chunk, loadid, log_tile_values):
-        now = datetime.now()
+        now = timezone.now()
         resources, tiles, edits = [], [], []
         resourceids = []
 
