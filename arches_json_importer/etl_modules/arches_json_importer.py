@@ -835,6 +835,10 @@ class ArchesJsonImporter(BaseImportModule):
 
         try:
             log_event_details(cursor, loadid, "done|Saving the tiles...")
+            # The etl-manager badge reads load_event.status alone: "running"
+            # renders as "Validating".  Validation is over by the time we get
+            # here, so move the status on the way core's save_to_tiles does.
+            LoadEvent.objects.filter(loadid=loadid).update(status="validated")
             disable_tile_triggers(cursor, loadid)
             try:
                 written = 0
@@ -860,6 +864,11 @@ class ArchesJsonImporter(BaseImportModule):
         finally:
             self._release_trigger_lock(cursor)
 
+        # "completed" is the badge's "Indexing" state; _post_save_edit_log
+        # takes it to "indexed" (or "unindexed" if indexing fails).
+        LoadEvent.objects.filter(loadid=loadid).update(
+            status="completed", load_end_time=timezone.now()
+        )
         response = _post_save_edit_log(userid, loadid, multiprocessing, max_subprocesses)
 
         # _post_save_edit_log stamps its finishing time through raw SQL with a
