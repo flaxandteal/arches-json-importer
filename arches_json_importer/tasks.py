@@ -2,6 +2,7 @@ import logging
 
 from celery import shared_task
 from django.contrib.auth.models import User
+from django.utils import timezone
 from django.utils.translation import gettext as _
 
 from arches.app.models import models
@@ -14,6 +15,9 @@ logger = logging.getLogger(__name__)
 def load_arches_json(userid, files, summary, result, temp_dir, loadid, moduleid):
     from arches_json_importer.etl_modules import arches_json_importer
 
+    # The finally clause below reports this, so it has to hold a value on every
+    # path out -- including the ones no except clause here catches.
+    status = _("Failed")
     try:
         importer = arches_json_importer.ArchesJsonImporter(
             loadid=loadid,
@@ -43,6 +47,17 @@ def load_arches_json(userid, files, summary, result, temp_dir, loadid, moduleid)
         logger.error(e, exc_info=True)
         models.LoadEvent.objects.filter(loadid=loadid).update(status="failed")
         status = _("Failed")
+    except BaseException:
+        # revoke(terminate=True) raises outside the Exception hierarchy, so the
+        # clause above never ran and the load_event sat on "running" forever --
+        # which the etl-manager badge reads as "Validating".  Cancel it the way
+        # the manager's own stop button does, then let the worker unwind.
+        logger.info("Arches JSON Import cancelled: loadid=%s", loadid)
+        models.LoadEvent.objects.filter(loadid=loadid).update(
+            status="cancelled", load_end_time=timezone.now()
+        )
+        status = _("Cancelled")
+        raise
     finally:
         msg = _("Arches JSON Import: {} [{}]").format(summary["name"], status)
         user = User.objects.get(id=userid)
