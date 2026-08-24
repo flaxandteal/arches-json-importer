@@ -465,6 +465,11 @@ class ArchesJsonImporter(BaseImportModule):
             if cached is not None:
                 return cached
 
+        # The node config goes in as kwargs so a datatype can validate against
+        # its own config.  That relies on every datatype ending its signature
+        # with **kwargs, as core's BaseDataType.validate does: Node.config is an
+        # I18n_JSONField, so a node with no config arrives as {"en": ""} and a
+        # datatype without the sink dies on "unexpected keyword argument 'en'".
         config = dict(node["config"] or {})
         config["nodeid"] = nodeid
         try:
