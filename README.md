@@ -51,31 +51,21 @@ Postgres function and registers the ETL module, which then appears under
 
 ## Command line
 
-The import also runs headless through Arches' own `etl` command, which is how
-large loads are usually done — the CLI path skips Celery (`celeryByteSizeLimit`
-is a UI-only threshold) and runs in the foreground, so the load survives as long
-as the shell does:
+Large loads are usually run headless. The command runs in the foreground and
+skips Celery entirely (`celeryByteSizeLimit` is a UI-only threshold), so the
+load lasts as long as the shell does.
 
 ```sh
-python manage.py etl arches-json-importer \
-    -s coral/pkg/business_data/all_business_data.jsonl \
-    -c /etl-config.json \
-    -mp -mxp 15
+python manage.py import_arches_json coral/pkg/business_data/all_business_data.jsonl -ow -mp -mxp 15
 ```
 
-| flag | meaning |
-| --- | --- |
-| *(positional)* | `arches-json-importer` — the module's `componentname`, or its uuid. Run `python manage.py etl` with no module to list what is registered. |
-| `-s`, `--source` | Path to the `.json`, `.jsonl` or `.zip` to load. |
-| `-c`, `--config` | Path to a JSON file of load options (below). Omit it for the defaults. |
-| `-mp`, `--use_multiprocessing` | Index the loaded resources across subprocesses. |
-| `-mxp`, `--max_subprocesses` | Pool size for `-mp`. Default `ceil(cpu_count()/2)`. |
-
-The config file holds the same options the UI offers. Only one is read here:
-
-```json
-{ "overwrite": true }
-```
+| flag | default | meaning |
+| --- | --- | --- |
+| *(positional)* | — | The `.json`, `.jsonl` or `.zip` to load. |
+| `-ow`, `--overwrite` | off | Replace resources whose ids already exist. |
+| `--no-index` | indexing on | Write the tiles but skip indexing. |
+| `-mp`, `--use_multiprocessing` | off | Index across subprocesses after loading. |
+| `-mxp`, `--max_subprocesses` | `ceil(cpu_count()/2)` | Pool size for `-mp`. |
 
 `overwrite` deletes each incoming resource's existing instance before writing it
 (cascading to its tiles), and relaxes the pre-load checks accordingly: a unique
@@ -83,8 +73,47 @@ constraint a resource violates against *itself* is not a clash, and cardinality
 is not checked against tiles that are about to be replaced. Left off, a
 resourceid that already exists is a validation failure.
 
+`--no-index` finishes the load with status `unindexed`: the tiles are durable
+but will not appear in search until you run `python manage.py index_database`.
+Useful when loading several files in a row — skip indexing on each and index
+once at the end:
+
+```sh
+for f in part-*.jsonl; do
+    python manage.py import_arches_json "$f" --no-index
+done
+python manage.py index_database
+```
+
+Indexing runs **once per load, not per resource**: tiles are written with the
+tile triggers disabled, and the Elasticsearch documents are built in a single
+pass at the end, scoped by the load's transaction id. So `--no-index` is
+all-or-nothing, and a failure there leaves the whole load unindexed rather than
+a fraction of it.
+
 The CLI has no request user, so the load is attributed to
 `settings.DEFAULT_RESOURCE_IMPORT_USER`; it must exist or the command raises.
+
+The generic `python manage.py etl arches-json-importer -s <file> -c <config.json>`
+still works, but needs a JSON config file for the same options and is not
+recommended.
+
+### In the ETL manager
+
+The panel offers **Overwrite resources that already exist** and **Index the data
+after import**, matching the two flags above. Multiprocessing is deliberately
+not offered: a load over `celeryByteSizeLimit` is handed to a Celery worker
+whose prefork processes are daemonic, so a pool there raises "daemonic processes
+are not allowed to have children" and the load would finish written but never
+indexed. Use the command line when you want indexing fan-out.
+
+### Reversal
+
+The module is registered `reversible: False`. With overwrite on it deletes and
+re-creates resources, logging `create`/`tile create` edits — and
+`reverse_edit_log_entries` *deletes* on those, so a reverse would destroy the
+originals rather than restore them. Core's JSON-LD importer is registered the
+same way for the same reason.
 
 ## Version coupling
 
