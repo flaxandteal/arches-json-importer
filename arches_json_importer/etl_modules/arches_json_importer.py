@@ -1,37 +1,4 @@
-"""
-Bulk import of Arches JSON business data through the ETL loader.
-
-Built for large loads (100k+ resources).  Two design choices distinguish it
-from the other import modules, both driven by that scale:
-
-1.  **Passing tiles never enter ``load_staging``.**  For the other modules the
-    staging table is the hand-off buffer to ``staging_to_tile``; this module
-    writes tiles itself, so the buffer would be a second full copy of the data
-    in Postgres for no benefit.  (Measured: a ``load_staging.value`` row is
-    ~2.2x the raw tile data, because the wrapper stores ``source`` as a
-    duplicate of ``value``.)  Rows that *fail* validation are still staged, so
-    ``__arches_load_staging_report_errors`` and the whole error-report UI work
-    unchanged -- it only ever reads ``WHERE passes_validation IS NOT true``.
-
-2.  **Tile values are validated but never transformed.**  Arches JSON is an
-    export: its tile values are already in tile shape.  Running them through
-    ``transform_value_for_tile`` with ``bulk_import=True`` -- as the CSV and
-    Excel modules must -- would mint fresh ``file_id``s for every file-list
-    value and orphan the existing files.  See ``_validate_tile``.
-
-The load runs in two passes over the source file so that validation is
-complete before anything is written: ``stage_files`` validates and records
-failures, and ``save_to_tiles`` re-reads and writes.  ``BaseImportModule.
-run_load_task`` already fails the load between the two if any errors were
-recorded.
-
-Input formats: ``.json`` (an Arches business-data export), ``.jsonl`` (one
-resource object per line, Arches' existing convention for large data), or a
-``.zip`` of either.  **Prefer .jsonl for very large loads** -- it streams,
-whereas a .json file is parsed whole.  To convert::
-
-    jq -c '.business_data.resources[]' export.json > export.jsonl
-"""
+"""Bulk import of Arches JSON business data through the ETL loader."""
 
 import json
 import logging
@@ -39,7 +6,6 @@ import os
 import time
 import uuid
 import zipfile
-from django.utils import timezone
 from pathlib import Path
 
 from django.contrib.auth.models import User
@@ -48,6 +14,7 @@ from django.core.files.storage import default_storage
 from django.core.files.uploadedfile import InMemoryUploadedFile
 from django.db import connection, transaction
 from django.http import HttpRequest
+from django.utils import timezone
 from django.utils.translation import gettext as _
 
 from arches.app.datatypes.datatypes import DataTypeFactory
@@ -67,6 +34,7 @@ from arches.app.models.models import (
     LoadEvent,
     LoadStaging,
     Node,
+    NodeGroup,
     ResourceInstance,
     ResourceInstanceLifecycleState,
     TileModel,
@@ -96,13 +64,22 @@ DB_CHECK_BATCH_SIZE = 20000
 
 
 class ArchesJsonImporter(BaseImportModule):
-    def __init__(self, request=None, loadid=None, temp_dir=None, params=None):
+    def __init__(
+        self,
+        request=None,
+        loadid=None,
+        temp_dir=None,
+        params=None,
+        userid=None,
+        moduleid=None,
+    ):
         self.loadid = request.POST.get("load_id") if request else loadid
-        self.userid = (
-            request.user.id
-            if request
-            else settings.DEFAULT_RESOURCE_IMPORT_USER["userid"]
-        )
+        if request:
+            self.userid = request.user.id
+        elif userid is not None:
+            self.userid = userid
+        else:
+            self.userid = settings.DEFAULT_RESOURCE_IMPORT_USER["userid"]
         self.mode = "cli" if not request and params else "ui"
         try:
             self.user = User.objects.get(pk=self.userid)
@@ -121,7 +98,7 @@ class ArchesJsonImporter(BaseImportModule):
             for k, v in params.items():
                 request.POST.__setitem__(k, v)
         self.request = request
-        self.moduleid = request.POST.get("module") if request else None
+        self.moduleid = request.POST.get("module") if request else moduleid
         self.config = (
             ETLModule.objects.get(pk=self.moduleid).config if self.moduleid else {}
         )
@@ -136,15 +113,13 @@ class ArchesJsonImporter(BaseImportModule):
 
     # --------------------------------------------------------------- options
 
+    # read(), write() and the Celery task are separate requests with separate
+    # instances, so the user's choices have to live on the load_event.
     def start(self, request):
-        """Persist the load options.
-
-        read(), write() and the Celery task are separate requests with separate
-        instances, so anything the user chose has to live on the load_event.
-        """
         self.temp_dir = os.path.join(settings.UPLOADED_FILES_DIR, "tmp", self.loadid)
         options = {
-            "overwrite": request.POST.get("overwrite") in ("true", "True", True),
+            "overwrite": self._flag(request, "overwrite"),
+            "index": self._flag(request, "index", default=True),
         }
         LoadEvent.objects.create(
             loadid=self.loadid,
@@ -156,6 +131,13 @@ class ArchesJsonImporter(BaseImportModule):
             load_details={"config": options},
         )
         return {"success": True, "data": {"started": True, "message": ""}}
+
+    @staticmethod
+    def _flag(request, name, default=False):
+        raw = request.POST.get(name)
+        if raw is None:
+            return default
+        return raw in ("true", "True", True)
 
     def _load_options(self):
         details = (
@@ -234,7 +216,9 @@ class ArchesJsonImporter(BaseImportModule):
 
     @staticmethod
     def _content_type(source):
-        return "application/zip" if source.lower().endswith(".zip") else "application/json"
+        return (
+            "application/zip" if source.lower().endswith(".zip") else "application/json"
+        )
 
     def _read_zip(self, content, result):
         with zipfile.ZipFile(content, "r") as zip_ref:
@@ -256,11 +240,6 @@ class ArchesJsonImporter(BaseImportModule):
     # -------------------------------------------------------------- streaming
 
     def _iter_resources(self, filename):
-        """Yield resource dicts from one staged file.
-
-        .jsonl streams a line at a time; .json is parsed whole, which is why
-        very large loads should be supplied as .jsonl.
-        """
         path = os.path.join(self.temp_dir, os.path.basename(filename))
         if filename.lower().endswith(".jsonl"):
             with default_storage.open(path, mode="rb") as handle:
@@ -278,6 +257,25 @@ class ArchesJsonImporter(BaseImportModule):
     # ------------------------------------------------------- pass 1: validate
 
     def stage_files(self, files, summary, cursor):
+        try:
+            self._stage_files(files, summary)
+        except Exception as e:
+            logger.exception(e)
+            try:
+                self._flush_failures(
+                    [
+                        self._failure(
+                            ", ".join(files) if files else None,
+                            _("Import failed while reading the file"),
+                            message="{}: {}".format(type(e).__name__, e),
+                        )
+                    ]
+                )
+            except Exception:
+                logger.exception("Could not record the import failure")
+                raise e
+
+    def _stage_files(self, files, summary):
         self._overwrite = bool(self._load_options().get("overwrite"))
         self._source_paths = list(files)
         seen_resourceids = set()
@@ -288,10 +286,8 @@ class ArchesJsonImporter(BaseImportModule):
         failures = []
         total = 0
 
-        # Validation writes nothing until it finishes - no staged rows, no
-        # load_description - so without this a large load looks hung for its
-        # whole first phase. Every 10,000 keeps it cheap (33 lines for a 331k
-        # load) while still showing rate and elapsed time.
+        # Validation writes nothing until it finishes, so without this a large
+        # load looks hung for its whole first phase.
         started = time.monotonic()
         for filename in self._source_paths:
             logger.info("validating %s", filename)
@@ -301,7 +297,9 @@ class ArchesJsonImporter(BaseImportModule):
                     elapsed = time.monotonic() - started
                     logger.info(
                         "validated %s resources (%.0f/s, %.0fs elapsed)",
-                        total, total / elapsed if elapsed else 0, elapsed,
+                        total,
+                        total / elapsed if elapsed else 0,
+                        elapsed,
                     )
                 errors = self._validate_resource(
                     resource,
@@ -324,13 +322,12 @@ class ArchesJsonImporter(BaseImportModule):
 
         logger.info(
             "validation finished: %s resources in %.0fs",
-            total, time.monotonic() - started,
+            total,
+            time.monotonic() - started,
         )
         self._counts = counts
         summary["resources"] = total
-        summary["by_graph"] = {
-            str(gid): value for gid, value in counts.items()
-        }
+        summary["by_graph"] = {str(gid): value for gid, value in counts.items()}
         LoadEvent.objects.filter(loadid=self.loadid).update(
             load_details={"config": self._load_options(), "summary": summary}
         )
@@ -374,11 +371,7 @@ class ArchesJsonImporter(BaseImportModule):
         try:
             graph = self._graph_info(graphid)
         except GraphModel.DoesNotExist:
-            return [
-                self._failure(
-                    source, _("Graph {} does not exist").format(graphid)
-                )
-            ]
+            return [self._failure(source, _("Graph {} does not exist").format(graphid))]
         except ValueError as unpublished:
             return [self._failure(source, str(unpublished))]
 
@@ -413,6 +406,15 @@ class ArchesJsonImporter(BaseImportModule):
                     source, _("Tile {} has no nodegroup_id").format(tile.get("tileid"))
                 )
             ]
+        if str(nodegroupid) not in graph["cardinality"]:
+            return [
+                self._failure(
+                    source,
+                    _("Nodegroup {} is not in graph {}").format(
+                        nodegroupid, graph["graphid"]
+                    ),
+                )
+            ]
 
         if graph["cardinality"].get(str(nodegroupid)) == "1":
             cardinality_keys.setdefault(
@@ -425,7 +427,9 @@ class ArchesJsonImporter(BaseImportModule):
                 failures.append(
                     self._failure(
                         source,
-                        _("Node {} is not in graph {}").format(nodeid, graph["graphid"]),
+                        _("Node {} is not in graph {}").format(
+                            nodeid, graph["graphid"]
+                        ),
                         nodeid=None,
                         nodegroupid=nodegroupid,
                     )
@@ -467,14 +471,9 @@ class ArchesJsonImporter(BaseImportModule):
         )
         return failures
 
+    # Validate only, never transform: the source is already a tile value, and
+    # transform_value_for_tile would mint new file_ids and orphan the files.
     def _validate_value(self, node, nodeid, value):
-        """Validate only -- never transform.
-
-        The CSV/Excel modules call transform_value_for_tile with
-        bulk_import=True because their source is a spreadsheet cell.  Ours is
-        already a tile value; transforming would mint new file_ids and discard
-        the existing ones.
-        """
         memo_key = None
         if nodeid not in self._memo_disabled_nodes:
             try:
@@ -486,11 +485,9 @@ class ArchesJsonImporter(BaseImportModule):
             if cached is not None:
                 return cached
 
-        # The node config goes in as kwargs so a datatype can validate against
-        # its own config.  That relies on every datatype ending its signature
-        # with **kwargs, as core's BaseDataType.validate does: Node.config is an
-        # I18n_JSONField, so a node with no config arrives as {"en": ""} and a
-        # datatype without the sink dies on "unexpected keyword argument 'en'".
+        # Config is splatted in as kwargs so a datatype can validate against it.
+        # Node.config is an I18n_JSONField, so an empty config arrives as
+        # {"en": ""} and a datatype without a **kwargs sink dies on it.
         config = dict(node["config"] or {})
         config["nodeid"] = nodeid
         try:
@@ -509,7 +506,6 @@ class ArchesJsonImporter(BaseImportModule):
         if memo_key is not None:
             node_memo = self.validated_data.setdefault(nodeid, {})
             if len(node_memo) >= MEMO_MAX_VALUES_PER_NODE:
-                # High-cardinality node: the memo will never pay for itself.
                 self._memo_disabled_nodes.add(nodeid)
                 self.validated_data.pop(nodeid, None)
             else:
@@ -554,25 +550,21 @@ class ArchesJsonImporter(BaseImportModule):
 
         nodes = {}
         cardinality = {}
-        for node in (
-            Node.objects.filter(graph_id=graphid)
-            .exclude(datatype="semantic")
-            .select_related("nodegroup")
-        ):
+        for node in Node.objects.filter(graph_id=graphid).select_related("nodegroup"):
+            if node.nodegroup_id:
+                cardinality[str(node.nodegroup_id)] = node.nodegroup.cardinality
+            if node.datatype == "semantic":
+                continue
             nodes[str(node.nodeid)] = {
                 "datatype": node.datatype,
                 "config": node.config,
                 "nodegroupid": str(node.nodegroup_id) if node.nodegroup_id else None,
             }
-            if node.nodegroup_id:
-                cardinality[str(node.nodegroup_id)] = node.nodegroup.cardinality
         lifecycle_state_id = None
         try:
-            lifecycle_state_id = (
-                graph.resource_instance_lifecycle.resource_instance_lifecycle_states.get(
-                    is_initial_state=True
-                ).pk
-            )
+            lifecycle_state_id = graph.resource_instance_lifecycle.resource_instance_lifecycle_states.get(
+                is_initial_state=True
+            ).pk
         except (AttributeError, ResourceInstanceLifecycleState.DoesNotExist):
             pass
 
@@ -609,43 +601,28 @@ class ArchesJsonImporter(BaseImportModule):
 
     # ------------------------------------------------- set-based DB checks
 
+    # Only the overwrite=False path reaches the checks below, and a 331k-resource
+    # load asks them about ~4.2M tiles -- past Postgres' bind-parameter limit.
     @staticmethod
-    def _in_batches(items, size=DB_CHECK_BATCH_SIZE):
-        """Yield slices of *items* so a check never builds one unbounded query.
-
-        Without this a 331k-resource import asks Postgres about ~4.2M tiles in a
-        single statement: three arrays of that many UUIDs for the cardinality
-        check, one IN clause for legacyids. It is only reached when overwrite is
-        off - the overwrite path returns before the query - which is why a load
-        that worked with overwrite=True died on "Unable to read file" without it.
-        """
+    def _in_batches(items, size=None):
+        # Read at call time, not bound as a default, so a test can shrink it.
+        size = size or DB_CHECK_BATCH_SIZE
         items = list(items)
         for start in range(0, len(items), size):
-            yield items[start:start + size]
-
+            yield items[start : start + size]
 
     @staticmethod
-    def _collect_constraint_candidates(
-        tile, resourceid, graph, constraint_candidates
-    ):
+    def _collect_constraint_candidates(tile, resourceid, graph, constraint_candidates):
         nodegroupid = str(tile.get("nodegroup_id"))
         for node_ids in graph["constraints"].get(nodegroupid, []):
             data = tile.get("data") or {}
             values = [data.get(nid) for nid in node_ids]
             if any(v is None for v in values):
                 continue
-            group = constraint_candidates.setdefault(
-                (nodegroupid, tuple(node_ids)), {}
-            )
+            group = constraint_candidates.setdefault((nodegroupid, tuple(node_ids)), {})
             group.setdefault(json.dumps(values, sort_keys=True), []).append(resourceid)
 
     def _check_global_constraints(self, constraint_candidates):
-        """Ask the database which of *our* values already exist.
-
-        Bounded by the distinct candidate values in the import, not by the size
-        of the tiles table -- the inverse of loading every existing value into
-        a Python set.
-        """
         failures = []
         for (nodegroupid, node_ids), group in constraint_candidates.items():
             for key, resourceids in group.items():
@@ -706,7 +683,9 @@ class ArchesJsonImporter(BaseImportModule):
         if not legacyids:
             return []
         failures = []
-        logger.info("checking %s legacyid(s) against existing resources", len(legacyids))
+        logger.info(
+            "checking %s legacyid(s) against existing resources", len(legacyids)
+        )
         existing = [
             row
             for batch in self._in_batches(legacyids)
@@ -731,7 +710,11 @@ class ArchesJsonImporter(BaseImportModule):
     def _check_existing_cardinality(self, cardinality_keys):
         failures = []
         wanted = []
-        for (resourceid, nodegroupid, parenttileid), tileids in cardinality_keys.items():
+        for (
+            resourceid,
+            nodegroupid,
+            parenttileid,
+        ), tileids in cardinality_keys.items():
             if len(tileids) > 1:
                 failures.append(
                     self._failure(
@@ -751,7 +734,10 @@ class ArchesJsonImporter(BaseImportModule):
         # One set-based existence check per batch, not one per resource.
         # parenttileid is compared too: cardinality on a child nodegroup is per
         # parent tile, so ignoring it would reject legitimate sibling tiles.
-        logger.info("checking cardinality against existing tiles for %s nodegroup(s)", len(wanted))
+        logger.info(
+            "checking cardinality against existing tiles for %s nodegroup(s)",
+            len(wanted),
+        )
         for batch in self._in_batches(wanted):
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -805,15 +791,13 @@ class ArchesJsonImporter(BaseImportModule):
             "value": value,
         }
 
+    # Only failures are staged: __arches_load_staging_report_errors reads
+    # "WHERE passes_validation IS NOT true", so the error-report UI works from
+    # these rows alone without a second copy of the passing data.
     def _flush_failures(self, failures):
-        """Record failures as LoadErrors plus a failing LoadStaging row.
-
-        Only failures are staged.  __arches_load_staging_report_errors reads
-        `WHERE passes_validation IS NOT true`, so the whole error-report UI
-        works from these rows alone.
-        """
         if not failures:
             return
+        self._demote_unknown_references(failures)
         LoadErrors.objects.bulk_create(
             [
                 LoadErrors(
@@ -851,11 +835,48 @@ class ArchesJsonImporter(BaseImportModule):
             batch_size=settings.BULK_IMPORT_BATCH_SIZE,
         )
 
+    # load_errors.nodeid and .nodegroupid are real foreign keys and these ids
+    # come from the import file, so an unknown one would fail the *error
+    # recording* and lose every other error in the batch with it.
+    @staticmethod
+    def _demote_unknown_references(failures):
+        nodegroupids = {f["nodegroupid"] for f in failures if f["nodegroupid"]}
+        nodeids = {f["nodeid"] for f in failures if f["nodeid"]}
+
+        known_nodegroups = set()
+        known_nodes = set()
+        if nodegroupids:
+            known_nodegroups = {
+                str(pk)
+                for pk in NodeGroup.objects.filter(
+                    nodegroupid__in=nodegroupids
+                ).values_list("nodegroupid", flat=True)
+            }
+        if nodeids:
+            known_nodes = {
+                str(pk)
+                for pk in Node.objects.filter(nodeid__in=nodeids).values_list(
+                    "nodeid", flat=True
+                )
+            }
+
+        for failure in failures:
+            for key, known, label in (
+                ("nodegroupid", known_nodegroups, "nodegroup"),
+                ("nodeid", known_nodes, "node"),
+            ):
+                value = failure[key]
+                if value and str(value) not in known:
+                    failure[key] = None
+                    failure["message"] = "{} ({} {} is not in this database)".format(
+                        failure["message"], label, value
+                    )
+
     # ---------------------------------------------------------- framework fit
 
+    # Handled in memory during pass 1; the SQL procedure reads load_staging,
+    # which this module leaves empty for passing rows.
     def check_tile_cardinality(self, cursor):
-        """Handled in memory during pass 1; the SQL procedure reads load_staging,
-        which this module deliberately leaves empty for passing rows."""
         return None
 
     def validate(self, loadid):
@@ -866,7 +887,9 @@ class ArchesJsonImporter(BaseImportModule):
     def save_to_tiles(
         self, cursor, userid, loadid, multiprocessing=False, max_subprocesses=0
     ):
-        self._overwrite = bool(self._load_options().get("overwrite"))
+        options = self._load_options()
+        self._overwrite = bool(options.get("overwrite"))
+        index = options.get("index", True)
         chunk_size = settings.BULK_IMPORT_BATCH_SIZE
         # edit_log.newvalue duplicates the tile data (~0.9KB/tile; ~4GB on a
         # 4.5M-tile load).  Reversal never reads it -- reverse_edit_log_entries
@@ -875,6 +898,13 @@ class ArchesJsonImporter(BaseImportModule):
         log_tile_values = bool(self.config.get("logTileValues", False))
 
         if not self._acquire_trigger_lock(cursor):
+            contention = _(
+                "Another bulk load is already running; only one may hold the "
+                "tile triggers at a time."
+            )
+            LoadEvent.objects.filter(loadid=loadid).update(
+                status="failed", load_end_time=timezone.now(), error_message=contention
+            )
             return {
                 "status": 409,
                 "success": False,
@@ -887,9 +917,8 @@ class ArchesJsonImporter(BaseImportModule):
 
         try:
             log_event_details(cursor, loadid, "done|Saving the tiles...")
-            # The etl-manager badge reads load_event.status alone: "running"
-            # renders as "Validating".  Validation is over by the time we get
-            # here, so move the status on the way core's save_to_tiles does.
+            # The etl-manager badge reads load_event.status alone, and "running"
+            # renders as "Validating".
             LoadEvent.objects.filter(loadid=loadid).update(status="validated")
             disable_tile_triggers(cursor, loadid)
             try:
@@ -904,10 +933,8 @@ class ArchesJsonImporter(BaseImportModule):
                 reenable_tile_triggers(cursor, loadid)
         except Exception as e:
             logger.exception(e)
-            # error_message too, not just the status.  This branch swallows the
-            # exception and returns a dict, so tasks.py never sees one and never
-            # gets to record it -- without this the ETL manager reports a failed
-            # load with "no errors found".
+            # This branch returns a dict rather than raising, so nothing else
+            # records the reason and the report reads "no errors found".
             LoadEvent.objects.filter(loadid=loadid).update(
                 status="failed", load_end_time=timezone.now(), error_message=str(e)
             )
@@ -925,27 +952,56 @@ class ArchesJsonImporter(BaseImportModule):
         LoadEvent.objects.filter(loadid=loadid).update(
             status="completed", load_end_time=timezone.now()
         )
-        response = _post_save_edit_log(userid, loadid, multiprocessing, max_subprocesses)
+        if index:
+            response = _post_save_edit_log(
+                userid, loadid, multiprocessing, max_subprocesses
+            )
+        else:
+            response = self._finish_without_indexing(userid, loadid)
 
-        # _post_save_edit_log stamps its finishing time through raw SQL with a
-        # naive datetime.now(), so DateTimeField.get_prep_value never runs and
-        # Postgres casts the bare timestamp under the session TimeZone -- UTC,
-        # because USE_TZ is on -- while load_start_time went through the ORM and
-        # was localised to TIME_ZONE.  An hour apart under BST, which shows up as
-        # an indexing duration an hour too long.  Re-stamp with an aware value:
-        # it lands within a second of what core wrote, and needs no core patch.
-        stamped = "indexed_time" if response.get("data") == "indexed" else "load_end_time"
+        # _post_save_edit_log stamps its finish through raw SQL with a naive
+        # datetime, which lands an hour out from the ORM-written start under BST.
+        stamped = (
+            "indexed_time" if response.get("data") == "indexed" else "load_end_time"
+        )
         LoadEvent.objects.filter(loadid=loadid).update(**{stamped: timezone.now()})
         return response
 
-    def _iter_resource_chunks(self, chunk_size):
-        """Re-read the source, yielding whole resources in chunks.
+    # Chunks break on resource boundaries: the tile FKs are DEFERRABLE INITIALLY
+    # DEFERRED, so a whole resource needs no parent-before-child ordering, but a
+    # resource split across two transactions would fail.
+    # The tail of core's _post_save_edit_log without the Elasticsearch pass. An
+    # application cannot add an index=False branch to core, so the two updates it
+    # still owes are issued here. resourcedisplayname is deliberately not set:
+    # it reads resource_instances.name, which only the descriptor pass fills in.
+    @staticmethod
+    def _finish_without_indexing(userid, loadid):
+        user = User.objects.get(id=userid)
+        with connection.cursor() as cursor:
+            log_event_details(cursor, loadid, "done|Updating the edit log...")
+            cursor.execute(
+                """
+                UPDATE edit_log
+                SET (userid, user_firstname, user_lastname, user_email, user_username)
+                    = (%s, %s, %s, %s, %s)
+                WHERE transactionid = %s
+                """,
+                (
+                    userid,
+                    getattr(user, "first_name", ""),
+                    getattr(user, "last_name", ""),
+                    getattr(user, "email", ""),
+                    getattr(user, "username", ""),
+                    loadid,
+                ),
+            )
+            log_event_details(cursor, loadid, "done")
+        LoadEvent.objects.filter(loadid=loadid).update(
+            status="unindexed", complete=True, successful=True
+        )
+        return {"success": True, "data": "unindexed"}
 
-        Chunking on resource boundaries matters: tiles.parenttileid and
-        tiles.resourceinstanceid are DEFERRABLE INITIALLY DEFERRED, so a chunk
-        that holds a resource and all of its tiles needs no parent-before-child
-        ordering -- but a resource split across two transactions would fail.
-        """
+    def _iter_resource_chunks(self, chunk_size):
         chunk = []
         for filename in self._source_paths:
             for resource in self._iter_resources(filename):
@@ -1038,8 +1094,6 @@ class ArchesJsonImporter(BaseImportModule):
     # ------------------------------------------------- set-based postprocess
 
     def _post_process(self, loadid):
-        """File links, resource relationships and geometries -- all scoped by
-        transaction, none per tile."""
         with connection.cursor() as cursor:
             # Create any missing File rows and point them at their tile.  This
             # is what FileListDataType.pre_tile_save does one row at a time --
