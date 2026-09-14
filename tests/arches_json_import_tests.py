@@ -2,6 +2,7 @@ from django.test import SimpleTestCase
 
 from arches_json_importer.etl_modules.arches_json_importer import (
     ArchesJsonImporter,
+    DB_CHECK_BATCH_SIZE,
     MEMO_MAX_VALUES_PER_NODE,
 )
 
@@ -160,3 +161,31 @@ class ValidationMemoTests(SimpleTestCase):
         second = importer._validate_value(node, self.NODE, "repeated")
         self.assertEqual(first, second)
         self.assertEqual(len(calls), 1, "second call should be served from the memo")
+
+
+class BatchedDbCheckTests(SimpleTestCase):
+    """The set-based existence checks only run when overwrite is off. Unbatched,
+    a 331k-resource import asked Postgres about ~4.2M tiles in one statement -
+    three arrays of that many UUIDs - and the load died reporting the generic
+    "Unable to read file"."""
+
+    def test_batches_cover_everything_in_order(self):
+        items = list(range(4_200_000))
+        batches = list(ArchesJsonImporter._in_batches(items))
+        self.assertEqual([x for b in batches for x in b], items)
+        self.assertLessEqual(max(len(b) for b in batches), DB_CHECK_BATCH_SIZE)
+
+    def test_batch_stays_under_the_bind_parameter_limit(self):
+        # legacyid__in becomes one bind parameter per value; Postgres caps at 65,535.
+        self.assertLess(DB_CHECK_BATCH_SIZE, 65535)
+
+    def test_empty_input_runs_no_query(self):
+        self.assertEqual(list(ArchesJsonImporter._in_batches([])), [])
+
+    def test_a_dict_batches_by_key(self):
+        # _check_global_constraints batches the candidate-value dict this way.
+        keys = {f"k{i}": i for i in range(5)}
+        self.assertEqual(
+            list(ArchesJsonImporter._in_batches(keys, 2)),
+            [["k0", "k1"], ["k2", "k3"], ["k4"]],
+        )
