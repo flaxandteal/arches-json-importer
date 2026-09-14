@@ -1,7 +1,6 @@
 from django.db import migrations
 from django.db.models import F, Max
 
-
 ARCHES_JSON_IMPORT_MODULE_PK = "0a1c9d67-8b4e-4f2a-9d31-6c5b2e7a4f18"
 
 # Per-transaction rebuild of resource_x_resource. Core refreshes relationships a
@@ -113,7 +112,7 @@ def add_module(apps, schema_editor):
                 "celeryByteSizeLimit": 100000,
                 "logTileValues": False,
             },
-            "reversible": True,
+            "reversible": False,  # does not support un-overwriting a resource
             "slug": "arches-json-importer",
             "description": "Import Arches JSON business data in bulk",
             "helptemplate": "arches-json-importer-help",
@@ -132,11 +131,13 @@ class Migration(migrations.Migration):
     initial = True
 
     dependencies = [
-        # The last core migration that changes anything this one writes:
-        # ETLModule.helptemplate and .helpsortorder. Deliberately not the
-        # latest core migration -- depending on that would pin the application
-        # to a single Arches patch release for no gain.
-        ("models", "9558_add_plugin_help"),
+        # The last core migration that adds a field this one writes:
+        # ETLModule.reversible. Not the latest core migration -- depending on
+        # that would pin the application to a single Arches patch release for
+        # no gain -- but it must not be earlier than any field in `defaults`,
+        # or the historical model lacks it and update_or_create raises
+        # FieldError during migrate.
+        ("models", "10165_etlmodule_reversible"),
     ]
 
     operations = [
