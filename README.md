@@ -49,6 +49,43 @@ The migration creates the `__arches_refresh_transaction_resource_relationships`
 Postgres function and registers the ETL module, which then appears under
 *Bulk Data Manager → Import*.
 
+## Command line
+
+The import also runs headless through Arches' own `etl` command, which is how
+large loads are usually done — the CLI path skips Celery (`celeryByteSizeLimit`
+is a UI-only threshold) and runs in the foreground, so the load survives as long
+as the shell does:
+
+```sh
+python manage.py etl arches-json-importer \
+    -s coral/pkg/business_data/all_business_data.jsonl \
+    -c /etl-config.json \
+    -mp -mxp 15
+```
+
+| flag | meaning |
+| --- | --- |
+| *(positional)* | `arches-json-importer` — the module's `componentname`, or its uuid. Run `python manage.py etl` with no module to list what is registered. |
+| `-s`, `--source` | Path to the `.json`, `.jsonl` or `.zip` to load. |
+| `-c`, `--config` | Path to a JSON file of load options (below). Omit it for the defaults. |
+| `-mp`, `--use_multiprocessing` | Index the loaded resources across subprocesses. |
+| `-mxp`, `--max_subprocesses` | Pool size for `-mp`. Default `ceil(cpu_count()/2)`. |
+
+The config file holds the same options the UI offers. Only one is read here:
+
+```json
+{ "overwrite": true }
+```
+
+`overwrite` deletes each incoming resource's existing instance before writing it
+(cascading to its tiles), and relaxes the pre-load checks accordingly: a unique
+constraint a resource violates against *itself* is not a clash, and cardinality
+is not checked against tiles that are about to be replaced. Left off, a
+resourceid that already exists is a validation failure.
+
+The CLI has no request user, so the load is attributed to
+`settings.DEFAULT_RESOURCE_IMPORT_USER`; it must exist or the command raises.
+
 ## Version coupling
 
 Pinned to `arches>=8.2.0a1,<8.3`. Both halves matter and the comment in
