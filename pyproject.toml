@@ -35,6 +35,8 @@ Repository = "https://github.com/flaxandteal/arches-json-importer"
 packages = [
     "arches_json_importer",
     "arches_json_importer.etl_modules",
+    "arches_json_importer.management",
+    "arches_json_importer.management.commands",
     "arches_json_importer.migrations",
 ]
 
