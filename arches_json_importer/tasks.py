@@ -25,27 +25,25 @@ def load_arches_json(userid, files, summary, result, temp_dir, loadid, moduleid)
         )
         importer.userid = userid
         importer.moduleid = moduleid
-        # Indexing is the long pole once the tiles are written, and it is
-        # CPU-bound in Python (nested doc + term building), not in ES -- a
-        # single process pegs one core of the box.  index_resources_by_transaction
-        # fans out over ceil(cpu_count()/2) subprocesses when asked; max_subprocesses=0
-        # means "use that default".
-        importer.run_load_task(
-            userid,
-            files,
-            summary,
-            result,
-            temp_dir,
-            loadid,
-            multiprocessing=True,
-            max_subprocesses=0,
-        )
+        # No multiprocessing here. Indexing is the long pole and is CPU-bound in
+        # Python, but this runs inside a celery prefork worker, whose processes
+        # are daemonic - multiprocessing.Pool then raises "daemonic processes are
+        # not allowed to have children", the tiles land and indexing never runs,
+        # and the load ends as "unindexed". Fan-out belongs to the CLI, where
+        # manage.py etl -mp -mxp N passes it through to run_load_task in an
+        # ordinary process.
+        importer.run_load_task(userid, files, summary, result, temp_dir, loadid)
 
         load_event = models.LoadEvent.objects.get(loadid=loadid)
         status = _("Completed") if load_event.status == "indexed" else _("Failed")
     except Exception as e:
         logger.error(e, exc_info=True)
-        models.LoadEvent.objects.filter(loadid=loadid).update(status="failed")
+        # Nothing else records this.  An exception raised outside validation --
+        # a failed spatial-view refresh, say -- leaves load_errors empty, so
+        # without error_message the error report reads "no errors found".
+        models.LoadEvent.objects.filter(loadid=loadid).update(
+            status="failed", error_message=str(e)
+        )
         status = _("Failed")
     except BaseException:
         # revoke(terminate=True) raises outside the Exception hierarchy, so the
