@@ -145,6 +145,13 @@
                 <th>{% trans "Details" %}</th>
             </tr>
         </thead>
+        <!-- ko if: selectedLoadEvent().error_message -->
+        <tbody>
+            <tr>
+                <td colspan="6" data-bind="text: selectedLoadEvent().error_message"></td>
+            </tr>
+        </tbody>
+        <!-- /ko -->
         <!-- ko if: validationErrors().length -->
         <tbody>
             <!-- ko foreach: validationErrors -->
