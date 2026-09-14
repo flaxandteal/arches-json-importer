@@ -36,6 +36,7 @@ whereas a .json file is parsed whole.  To convert::
 import json
 import logging
 import os
+import time
 import uuid
 import zipfile
 from django.utils import timezone
@@ -88,6 +89,10 @@ MEMO_MAX_VALUES_PER_NODE = 5000
 # not session-scoped -- so two concurrent bulk loads would race, the first to
 # finish re-enabling triggers while the second is still inserting.
 TILE_TRIGGER_LOCK_KEY = 8202514
+# How many rows a set-based existence check may ask about at once. Keeps the IN
+# clause under Postgres' 65,535 bind parameters and the unnest arrays small
+# enough to build without a memory spike.
+DB_CHECK_BATCH_SIZE = 20000
 
 
 class ArchesJsonImporter(BaseImportModule):
@@ -283,9 +288,21 @@ class ArchesJsonImporter(BaseImportModule):
         failures = []
         total = 0
 
+        # Validation writes nothing until it finishes - no staged rows, no
+        # load_description - so without this a large load looks hung for its
+        # whole first phase. Every 10,000 keeps it cheap (33 lines for a 331k
+        # load) while still showing rate and elapsed time.
+        started = time.monotonic()
         for filename in self._source_paths:
+            logger.info("validating %s", filename)
             for resource in self._iter_resources(filename):
                 total += 1
+                if total % 10000 == 0:
+                    elapsed = time.monotonic() - started
+                    logger.info(
+                        "validated %s resources (%.0f/s, %.0fs elapsed)",
+                        total, total / elapsed if elapsed else 0, elapsed,
+                    )
                 errors = self._validate_resource(
                     resource,
                     filename,
@@ -305,6 +322,10 @@ class ArchesJsonImporter(BaseImportModule):
         failures.extend(self._check_existing_cardinality(cardinality_keys))
         self._flush_failures(failures)
 
+        logger.info(
+            "validation finished: %s resources in %.0fs",
+            total, time.monotonic() - started,
+        )
         self._counts = counts
         summary["resources"] = total
         summary["by_graph"] = {
@@ -589,6 +610,21 @@ class ArchesJsonImporter(BaseImportModule):
     # ------------------------------------------------- set-based DB checks
 
     @staticmethod
+    def _in_batches(items, size=DB_CHECK_BATCH_SIZE):
+        """Yield slices of *items* so a check never builds one unbounded query.
+
+        Without this a 331k-resource import asks Postgres about ~4.2M tiles in a
+        single statement: three arrays of that many UUIDs for the cardinality
+        check, one IN clause for legacyids. It is only reached when overwrite is
+        off - the overwrite path returns before the query - which is why a load
+        that worked with overwrite=True died on "Unable to read file" without it.
+        """
+        items = list(items)
+        for start in range(0, len(items), size):
+            yield items[start:start + size]
+
+
+    @staticmethod
     def _collect_constraint_candidates(
         tile, resourceid, graph, constraint_candidates
     ):
@@ -634,17 +670,21 @@ class ArchesJsonImporter(BaseImportModule):
                       SELECT jsonb_array_elements(%s::jsonb)
                   )
             """
-            params = (
-                list(node_ids)
-                + [nodegroupid]
-                + list(node_ids)
-                + [json.dumps([json.loads(k) for k in group])]
-            )
-            with connection.cursor() as cursor:
-                cursor.execute(sql, params)
-                collisions = cursor.fetchall()
-
+            # importing is built from the whole group, not the batch: a
+            # colliding resource may sit in a different batch.
             importing = {rid for rids in group.values() for rid in rids}
+            collisions = []
+            for batch in self._in_batches(group):
+                params = (
+                    list(node_ids)
+                    + [nodegroupid]
+                    + list(node_ids)
+                    + [json.dumps([json.loads(k) for k in batch])]
+                )
+                with connection.cursor() as cursor:
+                    cursor.execute(sql, params)
+                    collisions.extend(cursor.fetchall())
+
             for raw_key, colliding_resourceid in collisions:
                 if self._overwrite and str(colliding_resourceid) in importing:
                     # This resource is being replaced; its own value is not a clash.
@@ -666,9 +706,14 @@ class ArchesJsonImporter(BaseImportModule):
         if not legacyids:
             return []
         failures = []
-        existing = ResourceInstance.objects.filter(
-            legacyid__in=list(legacyids)
-        ).values_list("legacyid", "resourceinstanceid")
+        logger.info("checking %s legacyid(s) against existing resources", len(legacyids))
+        existing = [
+            row
+            for batch in self._in_batches(legacyids)
+            for row in ResourceInstance.objects.filter(legacyid__in=batch).values_list(
+                "legacyid", "resourceinstanceid"
+            )
+        ]
         for legacyid, existing_resourceid in existing:
             resourceid, source = legacyids[legacyid]
             if str(existing_resourceid) == str(resourceid):
@@ -703,37 +748,39 @@ class ArchesJsonImporter(BaseImportModule):
         if self._overwrite or not wanted:
             return failures
 
-        # One set-based existence check, not one per resource.  parenttileid is
-        # compared too: cardinality on a child nodegroup is per parent tile, so
-        # ignoring it would reject legitimate sibling tiles.
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT t.resourceinstanceid, t.nodegroupid, t.parenttileid
-                FROM unnest(%s::uuid[], %s::uuid[], %s::uuid[])
-                     AS w(resourceid, nodegroupid, parenttileid)
-                JOIN tiles t
-                  ON t.resourceinstanceid = w.resourceid
-                 AND t.nodegroupid = w.nodegroupid
-                 AND t.parenttileid IS NOT DISTINCT FROM w.parenttileid
-                """,
-                [
-                    [r for r, _ng, _p in wanted],
-                    [ng for _r, ng, _p in wanted],
-                    [p for _r, _ng, p in wanted],
-                ],
-            )
-            for resourceid, nodegroupid, parenttileid in cursor.fetchall():
-                failures.append(
-                    self._failure(
-                        None,
-                        _(
-                            "Cardinality violation: resource {} already has a tile "
-                            "for single-value nodegroup {}"
-                        ).format(resourceid, nodegroupid),
-                        nodegroupid=nodegroupid,
-                    )
+        # One set-based existence check per batch, not one per resource.
+        # parenttileid is compared too: cardinality on a child nodegroup is per
+        # parent tile, so ignoring it would reject legitimate sibling tiles.
+        logger.info("checking cardinality against existing tiles for %s nodegroup(s)", len(wanted))
+        for batch in self._in_batches(wanted):
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT t.resourceinstanceid, t.nodegroupid, t.parenttileid
+                    FROM unnest(%s::uuid[], %s::uuid[], %s::uuid[])
+                         AS w(resourceid, nodegroupid, parenttileid)
+                    JOIN tiles t
+                      ON t.resourceinstanceid = w.resourceid
+                     AND t.nodegroupid = w.nodegroupid
+                     AND t.parenttileid IS NOT DISTINCT FROM w.parenttileid
+                    """,
+                    [
+                        [r for r, _ng, _p in batch],
+                        [ng for _r, ng, _p in batch],
+                        [p for _r, _ng, p in batch],
+                    ],
                 )
+                for resourceid, nodegroupid, parenttileid in cursor.fetchall():
+                    failures.append(
+                        self._failure(
+                            None,
+                            _(
+                                "Cardinality violation: resource {} already has a "
+                                "tile for single-value nodegroup {}"
+                            ).format(resourceid, nodegroupid),
+                            nodegroupid=nodegroupid,
+                        )
+                    )
         return failures
 
     # ------------------------------------------------------ failure recording
@@ -857,8 +904,12 @@ class ArchesJsonImporter(BaseImportModule):
                 reenable_tile_triggers(cursor, loadid)
         except Exception as e:
             logger.exception(e)
+            # error_message too, not just the status.  This branch swallows the
+            # exception and returns a dict, so tasks.py never sees one and never
+            # gets to record it -- without this the ETL manager reports a failed
+            # load with "no errors found".
             LoadEvent.objects.filter(loadid=loadid).update(
-                status="failed", load_end_time=timezone.now()
+                status="failed", load_end_time=timezone.now(), error_message=str(e)
             )
             return {
                 "status": 400,
