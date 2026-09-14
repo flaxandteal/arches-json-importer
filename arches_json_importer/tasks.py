@@ -22,9 +22,9 @@ def load_arches_json(userid, files, summary, result, temp_dir, loadid, moduleid)
         importer = arches_json_importer.ArchesJsonImporter(
             loadid=loadid,
             temp_dir=temp_dir,
+            userid=userid,
+            moduleid=moduleid,
         )
-        importer.userid = userid
-        importer.moduleid = moduleid
         # No multiprocessing here. Indexing is the long pole and is CPU-bound in
         # Python, but this runs inside a celery prefork worker, whose processes
         # are daemonic - multiprocessing.Pool then raises "daemonic processes are
