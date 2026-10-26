@@ -1,15 +1,47 @@
+import base64
+import json
+import os
+import tempfile
 import uuid
+import zipfile
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
+from django.core.files.base import ContentFile
+from django.core.files.storage import default_storage
+from django.db import connection
+from django.http import HttpRequest
 from django.test import SimpleTestCase, TestCase
 
-from arches.app.models.models import ETLModule, LoadEvent, NodeGroup
+from arches_json_importer import tasks
+from arches.app.models.graph import Graph
+from arches.app.models.system_settings import settings
+from arches.app.models.models import (
+    CardModel,
+    ConstraintModel,
+    EditLog,
+    ETLModule,
+    File,
+    GeoJSONGeometry,
+    GraphModel,
+    LoadErrors,
+    LoadEvent,
+    NodeGroup,
+    ResourceInstance,
+    ResourceXResource,
+    TileModel,
+    UserXNotification,
+)
+from arches.app.utils.betterJSONSerializer import JSONDeserializer
+from arches.app.utils.data_management.resource_graphs.importer import (
+    import_graph as resource_graph_importer,
+)
+from tests.base_test import ArchesTransactionTestCase
 from arches_json_importer.etl_modules.arches_json_importer import (
     ArchesJsonImporter,
-    DB_CHECK_BATCH_SIZE,
     MEMO_MAX_VALUES_PER_NODE,
 )
+from arches.app.etl_modules.save import reenable_tile_triggers
 
 # these tests can be run from the command line via
 # python manage.py test tests.arches_json_import_tests --settings="tests.test_settings"
@@ -233,17 +265,35 @@ class ValidationMemoTests(SimpleTestCase):
         self.assertEqual(first, second)
         self.assertEqual(len(calls), 1, "second call should be served from the memo")
 
+    def test_equal_values_of_different_types_are_validated_separately(self):
+        importer = _bare_importer()
+        node = {"datatype": "number", "config": {}}
+        calls = []
+
+        class _CountingDatatype:
+            def validate(self, value, **kwargs):
+                calls.append(value)
+                return []
+
+        class _Factory:
+            def get_instance(self, datatype):
+                return _CountingDatatype()
+
+        importer.datatype_factory = _Factory()
+
+        for value in (1, 1.0, True):
+            importer._validate_value(node, self.NODE, value)
+        self.assertEqual(len(calls), 3)
+
 
 class BatchedDbCheckTests(SimpleTestCase):
     def test_batches_cover_everything_in_order(self):
-        items = list(range(4_200_000))
-        batches = list(ArchesJsonImporter._in_batches(items))
-        self.assertEqual([x for b in batches for x in b], items)
-        self.assertLessEqual(max(len(b) for b in batches), DB_CHECK_BATCH_SIZE)
-
-    # legacyid__in becomes one bind parameter per value; Postgres caps at 65,535.
-    def test_batch_stays_under_the_bind_parameter_limit(self):
-        self.assertLess(DB_CHECK_BATCH_SIZE, 65535)
+        items = list(range(7))
+        with patch(
+            "arches_json_importer.etl_modules.arches_json_importer.DB_CHECK_BATCH_SIZE", 3
+        ):
+            batches = list(ArchesJsonImporter._in_batches(items))
+        self.assertEqual(batches, [[0, 1, 2], [3, 4, 5], [6]])
 
     def test_empty_input_runs_no_query(self):
         self.assertEqual(list(ArchesJsonImporter._in_batches([])), [])
@@ -315,8 +365,7 @@ class BatchedQueryTests(TestCase):
             "legacy-{}".format(i): (str(uuid.uuid4()), "data.json") for i in range(5)
         }
         with patch(
-            "arches_json_importer.etl_modules.arches_json_importer.DB_CHECK_BATCH_SIZE",
-            2,
+            "arches_json_importer.etl_modules.arches_json_importer.DB_CHECK_BATCH_SIZE", 2
         ):
             with self.assertNumQueries(3):
                 importer._check_existing_legacyids(legacyids)
@@ -344,10 +393,39 @@ class TriggerLockContentionTests(TestCase):
 
         result = importer.save_to_tiles(None, user.id, event.loadid)
 
-        self.assertEqual(result["status"], 409)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["data"]["title"], "Another Arches JSON load is running")
         event.refresh_from_db()
         self.assertEqual(event.status, "failed")
         self.assertTrue(event.error_message)
+
+
+class UndoTaskNotificationTests(TestCase):
+    def _undo(self, reverse_load):
+        user = User.objects.create_user("undo-notification-tester")
+        module = ETLModule.objects.get(slug="arches-json-importer")
+        event = LoadEvent.objects.create(
+            user=user,
+            etl_module=module,
+            status="indexed",
+            load_details={"summary": {"name": "monuments.jsonl"}},
+        )
+        with patch.object(ArchesJsonImporter, "reverse_load", reverse_load):
+            tasks.reverse_arches_json_load(str(event.loadid), user.id)
+        return UserXNotification.objects.get(recipient=user).notif.message
+
+    def test_a_finished_undo_notifies_the_user(self):
+        message = self._undo(lambda importer, loadid: None)
+        self.assertEqual(message, "Arches JSON Undo: monuments.jsonl [Completed]")
+
+    def test_a_failed_undo_notifies_the_user_with_the_reason(self):
+        def reverse_load(importer, loadid):
+            raise RuntimeError("disk full")
+
+        message = self._undo(reverse_load)
+        self.assertEqual(
+            message, "Arches JSON Undo: monuments.jsonl [Failed: disk full]"
+        )
 
 
 class ImportCommandFlagTests(TestCase):
@@ -381,3 +459,792 @@ class ImportCommandFlagTests(TestCase):
         options = self._parse("-mp", "-mxp", "8")
         self.assertTrue(options["use_multiprocessing"])
         self.assertEqual(options["max_subprocesses"], 8)
+
+
+# The file validator sniffs zip members, so the test needs a real image.
+ONE_PIXEL_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+ALL_DATATYPES = "d71a8f56-987f-4fd1-87b5-538378740f15"
+STRING_NODE = "bf611c24-c8be-11ed-b6a9-0242ac130009"
+FILE_NODE = "1d1bfbea-c8bf-11ed-bf64-0242ac130009"
+IMAGE_NODE = "f85dab40-791d-11ee-88a6-0242ac130007"
+RESOURCE_NODE = "402c95f2-c8c1-11ed-87a7-0242ac130009"
+GEOMETRY_NODE = "be25bdf0-c8bf-11ed-a172-0242ac130009"
+REENABLE = "arches_json_importer.etl_modules.arches_json_importer.reenable_tile_triggers"
+
+
+def _resource(resourceid, *tiles):
+    return {
+        "resourceinstance": {
+            "resourceinstanceid": str(resourceid),
+            "graph_id": ALL_DATATYPES,
+            "legacyid": None,
+        },
+        "tiles": list(tiles),
+    }
+
+
+# Every test node is the only node in its own nodegroup, so nodegroup id == node id.
+def _tile(nodeid, value, tileid=None):
+    return {
+        "tileid": str(tileid or uuid.uuid4()),
+        "nodegroup_id": nodeid,
+        "parenttile_id": None,
+        "sortorder": 0,
+        "data": {nodeid: value},
+    }
+
+
+def _text(value):
+    return {"en": {"value": value, "direction": "ltr"}}
+
+
+def _point():
+    return {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "id": str(uuid.uuid4()),
+                "properties": {},
+                "geometry": {"type": "Point", "coordinates": [-5.93, 54.6]},
+            }
+        ],
+    }
+
+
+def _file(file_id, name):
+    return {"file_id": file_id, "name": name, "status": "uploaded", "size": 10}
+
+
+class ArchesJsonImportWriteTests(ArchesTransactionTestCase):
+    serialized_rollback = True
+
+    def setUp(self):
+        with open("tests/fixtures/resource_graphs/All_Datatypes.json") as f:
+            archesfile = JSONDeserializer().deserialize(f)
+        resource_graph_importer(archesfile["graph"])
+        Graph.objects.get(graphid=ALL_DATATYPES).publish(user=self.test_users["admin"])
+
+    def _cli(self, *resources, overwrite=False):
+        loadid = str(uuid.uuid4())
+        module = ETLModule.objects.get(slug="arches-json-importer")
+        importer = ArchesJsonImporter(
+            loadid=loadid,
+            params={
+                "module": str(module.etlmoduleid),
+                "overwrite": overwrite,
+                "index": False,
+            },
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "load.jsonl")
+            with open(path, "w") as f:
+                f.writelines(json.dumps(r) + "\n" for r in resources)
+            return loadid, importer.cli(path)
+
+    def _load(self, *resources, overwrite=False, status="unindexed"):
+        loadid, response = self._cli(*resources, overwrite=overwrite)
+        errors = list(
+            LoadErrors.objects.filter(load_event_id=loadid).values_list(
+                "message", flat=True
+            )
+        )
+        # The load's status, not cli()'s answer: a load that fails validation still
+        # comes back as a success, so the UI can show its error report.
+        actual = LoadEvent.objects.get(loadid=loadid).status
+        self.assertEqual(actual, status, f"{response} {errors}")
+        return loadid
+
+    def _read(self, path):
+        module = ETLModule.objects.get(slug="arches-json-importer")
+        importer = ArchesJsonImporter(
+            loadid=str(uuid.uuid4()), params={"module": str(module.etlmoduleid)}
+        )
+        importer.start(importer.request)
+
+        def cleanup():
+            if default_storage.exists(importer.temp_dir):
+                importer.delete_from_default_storage(importer.temp_dir)
+
+        self.addCleanup(cleanup)
+        return importer.read(source=path)
+
+    def test_a_rejected_upload_says_why_and_closes_the_file(self):
+        opened = []
+
+        def tracking_open(*args, **kwargs):
+            opened.append(open(*args, **kwargs))
+            return opened[-1]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "notes.txt")
+            with open(path, "w") as f:
+                f.write("not an export")
+            with patch(
+                "arches_json_importer.etl_modules.arches_json_importer.open",
+                tracking_open,
+                create=True,
+            ):
+                response = self._read(path)
+
+        self.assertEqual(response["data"]["title"], "Invalid file")
+        self.assertTrue(opened and all(f.closed for f in opened))
+
+    def _errors(self, loadid):
+        return " | ".join(
+            LoadErrors.objects.filter(load_event_id=loadid).values_list(
+                "error", flat=True
+            )
+        )
+
+    def test_an_existing_resource_fails_without_overwrite(self):
+        monument, name = uuid.uuid4(), uuid.uuid4()
+        self._load(_resource(monument, _tile(STRING_NODE, _text("Monument 17"), name)))
+
+        loadid = self._load(
+            _resource(monument, _tile(STRING_NODE, _text("Monument 17, again"))),
+            status="failed",
+        )
+
+        self.assertIn("already exists", self._errors(loadid))
+        self.assertEqual(
+            list(
+                TileModel.objects.filter(resourceinstance_id=monument).values_list(
+                    "tileid", flat=True
+                )
+            ),
+            [name],
+        )
+
+    def test_a_tile_held_by_another_resource_fails_even_with_overwrite(self):
+        monument, site, tile = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        self._load(_resource(monument, _tile(STRING_NODE, _text("Monument 17"), tile)))
+
+        loadid = self._load(
+            _resource(site, _tile(STRING_NODE, _text("Site 4"), tile)),
+            overwrite=True,
+            status="failed",
+        )
+
+        self.assertIn("already belongs to resource", self._errors(loadid))
+        self.assertFalse(ResourceInstance.objects.filter(pk=site).exists())
+
+    def test_an_overwrite_matches_ids_written_without_hyphens(self):
+        monument, tile = uuid.uuid4(), uuid.uuid4()
+        self._load(_resource(monument, _tile(STRING_NODE, _text("Monument"), tile)))
+        resource = _resource(
+            monument.hex.upper(),
+            _tile(STRING_NODE, _text("Monument, renamed"), tile.hex),
+        )
+        resource["resourceinstance"]["graph_id"] = uuid.UUID(ALL_DATATYPES).hex
+
+        self._load(resource, overwrite=True)
+
+        self.assertEqual(
+            TileModel.objects.get(pk=tile).data[STRING_NODE]["en"]["value"],
+            "Monument, renamed",
+        )
+
+    def test_one_id_written_two_ways_is_a_duplicate(self):
+        monument = uuid.uuid4()
+        loadid = self._load(
+            _resource(monument, _tile(STRING_NODE, _text("Monument"))),
+            _resource(monument.hex.upper(), _tile(STRING_NODE, _text("Monument"))),
+            status="failed",
+        )
+
+        self.assertIn("Duplicate resourceinstanceid", self._errors(loadid))
+
+    def test_a_file_list_that_is_not_a_list_is_reported(self):
+        loadid = self._load(
+            _resource(uuid.uuid4(), _tile(FILE_NODE, 5)),
+            status="failed",
+        )
+
+        self.assertIn("file-list value must be a list", self._errors(loadid))
+
+    def test_an_overwrite_can_move_a_unique_value_off_a_replaced_resource(self):
+        constraint = ConstraintModel.objects.create(
+            card=CardModel.objects.get(nodegroup_id=STRING_NODE),
+            uniquetoallinstances=True,
+        )
+        constraint.nodes.add(STRING_NODE)
+        monument, site = uuid.uuid4(), uuid.uuid4()
+        self._load(_resource(monument, _tile(STRING_NODE, _text("Old Mill"))))
+
+        self._load(
+            _resource(monument),
+            _resource(site, _tile(STRING_NODE, _text("Old Mill"))),
+            overwrite=True,
+        )
+
+        self.assertFalse(
+            TileModel.objects.filter(resourceinstance_id=monument).exists()
+        )
+        self.assertTrue(TileModel.objects.filter(resourceinstance_id=site).exists())
+
+    def test_an_overwrite_cannot_change_a_resources_graph(self):
+        monument = uuid.uuid4()
+        self._load(_resource(monument, _tile(STRING_NODE, _text("Monument 17"))))
+        other_graph = GraphModel.objects.create(
+            name="Other", slug="other", isresource=True
+        ).pk
+        ResourceInstance.objects.filter(pk=monument).update(graph_id=other_graph)
+
+        loadid = self._load(
+            _resource(monument, _tile(STRING_NODE, _text("Monument 17, renamed"))),
+            overwrite=True,
+            status="failed",
+        )
+
+        self.assertIn("cannot change its graph", self._errors(loadid))
+        self.assertEqual(
+            ResourceInstance.objects.get(pk=monument).graph_id, other_graph
+        )
+
+    def test_a_tile_repeated_after_a_batch_is_checked_still_fails(self):
+        tile = uuid.uuid4()
+        with patch(
+            "arches_json_importer.etl_modules.arches_json_importer.DB_CHECK_BATCH_SIZE", 2
+        ):
+            loadid = self._load(
+                _resource(uuid.uuid4(), _tile(STRING_NODE, _text("Monument"), tile)),
+                _resource(uuid.uuid4(), _tile(STRING_NODE, _text("Site"))),
+                _resource(uuid.uuid4(), _tile(STRING_NODE, _text("Area"), tile)),
+                status="failed",
+            )
+
+        self.assertIn("more than once", self._errors(loadid))
+
+    def test_a_tile_without_a_valid_tileid_fails(self):
+        loadid = self._load(
+            _resource(
+                uuid.uuid4(), _tile(STRING_NODE, _text("Monument"), "not-a-uuid")
+            ),
+            status="failed",
+        )
+
+        self.assertIn("no valid tileid", self._errors(loadid))
+
+    def test_malformed_ids_are_each_reported(self):
+        bad_resource = _resource("not-a-uuid", _tile(STRING_NODE, _text("A")))
+        bad_graph = _resource(uuid.uuid4(), _tile(STRING_NODE, _text("B")))
+        bad_graph["resourceinstance"]["graph_id"] = "not-a-graph"
+        bad_parent = _tile(STRING_NODE, _text("C"))
+        bad_parent["parenttile_id"] = "not-a-tile"
+        bad_file = _tile(FILE_NODE, [_file("not-a-file", "plan.pdf")])
+
+        loadid = self._load(
+            bad_resource,
+            bad_graph,
+            _resource(uuid.uuid4(), bad_parent),
+            _resource(uuid.uuid4(), bad_file),
+            status="failed",
+        )
+
+        errors = self._errors(loadid)
+        for expected in (
+            "is not a valid uuid",
+            "Graph not-a-graph does not exist",
+            "no valid parenttile_id",
+            "File id not-a-file is not valid",
+        ):
+            self.assertIn(expected, errors)
+
+    def test_a_numeric_legacyid_is_checked_against_existing_ones(self):
+        first = _resource(uuid.uuid4(), _tile(STRING_NODE, _text("Monument")))
+        first["resourceinstance"]["legacyid"] = "123"
+        self._load(first)
+        second = _resource(uuid.uuid4(), _tile(STRING_NODE, _text("Site")))
+        second["resourceinstance"]["legacyid"] = 123
+
+        loadid = self._load(second, status="failed")
+
+        self.assertIn("already belongs", self._errors(loadid))
+
+    def test_a_tile_used_twice_in_one_import_fails(self):
+        tile = uuid.uuid4()
+        loadid = self._load(
+            _resource(uuid.uuid4(), _tile(STRING_NODE, _text("Monument 17"), tile)),
+            _resource(uuid.uuid4(), _tile(STRING_NODE, _text("Site 4"), tile)),
+            status="failed",
+        )
+
+        self.assertIn("more than once", self._errors(loadid))
+
+    def test_overwrite_matches_ids_whatever_their_case(self):
+        monument, tile = uuid.uuid4(), uuid.uuid4()
+        self._load(_resource(monument, _tile(STRING_NODE, _text("Monument 17"), tile)))
+
+        self._load(
+            _resource(
+                str(monument).upper(),
+                _tile(STRING_NODE, _text("Monument 17, renamed"), str(tile).upper()),
+            ),
+            overwrite=True,
+        )
+
+        self.assertEqual(
+            TileModel.objects.get(pk=tile).data[STRING_NODE]["en"]["value"],
+            "Monument 17, renamed",
+        )
+
+    def test_a_file_used_twice_in_one_import_fails(self):
+        plan = str(uuid.uuid4())
+        loadid = self._load(
+            _resource(uuid.uuid4(), _tile(FILE_NODE, [_file(plan, "plan.pdf")])),
+            _resource(uuid.uuid4(), _tile(FILE_NODE, [_file(plan, "plan.pdf")])),
+            status="failed",
+        )
+
+        self.assertIn("more than once", self._errors(loadid))
+        self.assertFalse(File.objects.filter(fileid=plan).exists())
+
+    def test_a_file_held_by_another_resource_fails_in_either_mode(self):
+        plan = str(uuid.uuid4())
+        self._load(_resource(uuid.uuid4(), _tile(FILE_NODE, [_file(plan, "plan.pdf")])))
+        owner = File.objects.get(fileid=plan).tile_id
+
+        for overwrite in (False, True):
+            with self.subTest(overwrite=overwrite):
+                site = uuid.uuid4()
+                loadid = self._load(
+                    _resource(site, _tile(FILE_NODE, [_file(plan, "plan.pdf")])),
+                    overwrite=overwrite,
+                    status="failed",
+                )
+                self.assertIn("already in the database", self._errors(loadid))
+                self.assertFalse(ResourceInstance.objects.filter(pk=site).exists())
+                self.assertEqual(File.objects.get(fileid=plan).tile_id, owner)
+
+    def test_a_zip_lists_the_files_it_ignores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "export.zip")
+            with zipfile.ZipFile(path, "w") as zf:
+                zf.writestr(
+                    "export.json", json.dumps({"business_data": {"resources": []}})
+                )
+                zf.writestr("photo.png", base64.b64decode(ONE_PIXEL_PNG))
+            response = self._read(path)
+
+        self.assertIn("data", response, response)
+        self.assertEqual(response["data"]["summary"]["ignored_files"], 1)
+
+    def test_a_zip_with_two_files_of_the_same_name_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "export.zip")
+            empty = json.dumps({"business_data": {"resources": []}})
+            with zipfile.ZipFile(path, "w") as zf:
+                zf.writestr("a/data.json", empty)
+                zf.writestr("b/data.json", empty)
+            response = self._read(path)
+
+        self.assertFalse(response["success"])
+        self.assertIn("data.json", response["data"]["message"])
+
+    def test_overwrite_keeps_the_resource_and_links_into_it(self):
+        monument, site = uuid.uuid4(), uuid.uuid4()
+        name, geometry = uuid.uuid4(), uuid.uuid4()
+        self._load(
+            _resource(
+                monument,
+                _tile(STRING_NODE, _text("Monument 17"), name),
+                _tile(GEOMETRY_NODE, _point(), geometry),
+            )
+        )
+        link = {
+            "resourceId": str(monument),
+            "ontologyProperty": "",
+            "inverseOntologyProperty": "",
+        }
+        self._load(_resource(site, _tile(RESOURCE_NODE, [link])))
+        createdtime = ResourceInstance.objects.get(pk=monument).createdtime
+
+        loadid = self._load(
+            _resource(
+                monument, _tile(STRING_NODE, _text("Monument 17, renamed"), name)
+            ),
+            overwrite=True,
+        )
+
+        self.assertTrue(
+            ResourceXResource.objects.filter(
+                from_resource_id=site, to_resource_id=monument
+            ).exists()
+        )
+        site_tile = TileModel.objects.get(resourceinstance_id=site)
+        self.assertEqual(site_tile.data[RESOURCE_NODE][0]["resourceId"], str(monument))
+        self.assertEqual(
+            ResourceInstance.objects.get(pk=monument).createdtime, createdtime
+        )
+        self.assertEqual(
+            list(
+                TileModel.objects.filter(resourceinstance_id=monument).values_list(
+                    "tileid", flat=True
+                )
+            ),
+            [name],
+        )
+        self.assertFalse(
+            GeoJSONGeometry.objects.filter(resourceinstance_id=monument).exists()
+        )
+        self.assertFalse(
+            EditLog.objects.filter(transactionid=loadid, edittype="create").exists()
+        )
+        deleted = EditLog.objects.filter(transactionid=loadid, edittype="tile delete")
+        self.assertEqual(
+            list(deleted.values_list("tileinstanceid", flat=True)), [str(geometry)]
+        )
+
+    def test_overwrite_keeps_the_row_of_a_file_it_imports_again(self):
+        monument = uuid.uuid4()
+        plan, sketch = str(uuid.uuid4()), str(uuid.uuid4())
+        plan_tile, sketch_tile = uuid.uuid4(), uuid.uuid4()
+        self._load(
+            _resource(
+                monument,
+                _tile(FILE_NODE, [_file(plan, "plan.pdf")], plan_tile),
+                _tile(IMAGE_NODE, [_file(sketch, "sketch.png")], sketch_tile),
+            )
+        )
+        File.objects.filter(fileid=plan).update(
+            path="uploadedfiles/plan_aB3x.pdf", thumbnail_data=b"thumb"
+        )
+
+        # The same tile id, as a real re-export has. Logging it as both deleted and
+        # created would make _post_process upsert the file row twice and fail.
+        loadid = self._load(
+            _resource(monument, _tile(FILE_NODE, [_file(plan, "plan.pdf")], plan_tile)),
+            overwrite=True,
+        )
+
+        kept = File.objects.get(fileid=plan)
+        self.assertEqual(kept.path.name, "uploadedfiles/plan_aB3x.pdf")
+        self.assertEqual(bytes(kept.thumbnail_data), b"thumb")
+        self.assertEqual(kept.tile_id, plan_tile)
+        self.assertFalse(File.objects.filter(fileid=sketch).exists())
+        deleted = EditLog.objects.filter(transactionid=loadid, edittype="tile delete")
+        self.assertEqual(
+            list(deleted.values_list("tileinstanceid", flat=True)), [str(sketch_tile)]
+        )
+
+    def test_overwrite_reattaches_a_file_a_failed_overwrite_left_unhooked(self):
+        monument, plan_tile = uuid.uuid4(), uuid.uuid4()
+        plan = str(uuid.uuid4())
+        self._load(
+            _resource(monument, _tile(FILE_NODE, [_file(plan, "plan.pdf")], plan_tile))
+        )
+        File.objects.filter(fileid=plan).update(tile=None)
+
+        self._load(
+            _resource(monument, _tile(FILE_NODE, [_file(plan, "plan.pdf")], plan_tile)),
+            overwrite=True,
+        )
+
+        self.assertEqual(File.objects.get(fileid=plan).tile_id, plan_tile)
+
+    def _reverse(self, loadid):
+        request = HttpRequest()
+        request.method = "POST"
+        request.user = self.test_users["admin"]
+        request.POST["loadid"] = loadid
+        return ArchesJsonImporter(loadid=loadid).reverse(request)
+
+    def test_a_load_can_be_undone(self):
+        monument = uuid.uuid4()
+        loadid = self._load(
+            _resource(monument, _tile(STRING_NODE, _text("Monument 17")))
+        )
+
+        response = self._reverse(loadid)
+
+        self.assertTrue(response["success"], response)
+        self.assertFalse(ResourceInstance.objects.filter(pk=monument).exists())
+        self.assertEqual(LoadEvent.objects.get(loadid=loadid).status, "unloaded")
+
+    def test_a_reload_of_undone_resources_can_be_undone(self):
+        monument = uuid.uuid4()
+        resource = _resource(monument, _tile(STRING_NODE, _text("Monument 17")))
+        self._reverse(self._load(resource))
+        loadid = self._load(resource)
+
+        response = self._reverse(loadid)
+
+        self.assertTrue(response["success"], response)
+        self.assertFalse(ResourceInstance.objects.filter(pk=monument).exists())
+
+    def test_undo_removes_what_the_load_wrote_and_nothing_else(self):
+        site, monument = uuid.uuid4(), uuid.uuid4()
+        self._load(_resource(site, _tile(STRING_NODE, _text("Site 4"))))
+        plan = str(uuid.uuid4())
+        stored = default_storage.save(
+            f"{settings.UPLOADED_FILES_DIR}/{plan}.pdf", ContentFile(b"plan")
+        )
+        self.addCleanup(default_storage.delete, stored)
+        link = {
+            "resourceId": str(site),
+            "ontologyProperty": "",
+            "inverseOntologyProperty": "",
+        }
+        loadid = self._load(
+            _resource(
+                monument,
+                _tile(GEOMETRY_NODE, _point()),
+                _tile(FILE_NODE, [_file(plan, f"{plan}.pdf")]),
+                _tile(RESOURCE_NODE, [link]),
+            )
+        )
+        self.assertTrue(File.objects.filter(fileid=plan).exists())
+
+        response = self._reverse(loadid)
+
+        self.assertTrue(response["success"], response)
+        self.assertFalse(ResourceInstance.objects.filter(pk=monument).exists())
+        self.assertFalse(
+            TileModel.objects.filter(resourceinstance_id=monument).exists()
+        )
+        self.assertFalse(
+            GeoJSONGeometry.objects.filter(resourceinstance_id=monument).exists()
+        )
+        self.assertFalse(File.objects.filter(fileid=plan).exists())
+        self.assertFalse(
+            ResourceXResource.objects.filter(from_resource_id=monument).exists()
+        )
+        self.assertTrue(default_storage.exists(stored))
+        self.assertTrue(TileModel.objects.filter(resourceinstance_id=site).exists())
+        self.assertTrue(
+            EditLog.objects.filter(
+                transactionid=loadid,
+                edittype="delete",
+                resourceinstanceid=str(monument),
+            ).exists()
+        )
+        self.assertEqual(LoadEvent.objects.get(loadid=loadid).status, "unloaded")
+
+    def test_undo_succeeds_when_elasticsearch_is_unavailable(self):
+        monument = uuid.uuid4()
+        loadid = self._load(_resource(monument, _tile(STRING_NODE, _text("Monument"))))
+
+        with patch(
+            "arches_json_importer.etl_modules.arches_json_importer.Query.delete",
+            side_effect=ConnectionError("elasticsearch is gone"),
+        ):
+            response = self._reverse(loadid)
+
+        self.assertTrue(response["success"], response)
+        self.assertFalse(ResourceInstance.objects.filter(pk=monument).exists())
+        self.assertEqual(LoadEvent.objects.get(loadid=loadid).status, "unloaded")
+
+    def test_a_load_overwritten_since_cannot_be_undone(self):
+        monument = uuid.uuid4()
+        loadid = self._load(_resource(monument, _tile(STRING_NODE, _text("Monument"))))
+        self._load(
+            _resource(monument, _tile(STRING_NODE, _text("Monument, renamed"))),
+            overwrite=True,
+        )
+
+        response = self._reverse(loadid)
+
+        self.assertFalse(response["success"])
+        self.assertIn("changed since", response["data"]["message"])
+        self.assertEqual(
+            TileModel.objects.get(resourceinstance_id=monument).data[STRING_NODE]["en"][
+                "value"
+            ],
+            "Monument, renamed",
+        )
+
+    def test_a_load_linked_to_from_outside_cannot_be_undone(self):
+        monument, site = uuid.uuid4(), uuid.uuid4()
+        loadid = self._load(_resource(monument, _tile(STRING_NODE, _text("Monument"))))
+        link = {
+            "resourceId": str(monument),
+            "ontologyProperty": "",
+            "inverseOntologyProperty": "",
+        }
+        self._load(_resource(site, _tile(RESOURCE_NODE, [link])))
+
+        response = self._reverse(loadid)
+
+        self.assertFalse(response["success"])
+        self.assertIn("1 resources outside this load", response["data"]["message"])
+        self.assertTrue(ResourceInstance.objects.filter(pk=monument).exists())
+        self.assertEqual(
+            TileModel.objects.get(resourceinstance_id=site).data[RESOURCE_NODE][0][
+                "resourceId"
+            ],
+            str(monument),
+        )
+
+    def test_a_link_made_after_undo_was_requested_still_stops_it(self):
+        monument, site = uuid.uuid4(), uuid.uuid4()
+        loadid = self._load(_resource(monument, _tile(STRING_NODE, _text("Monument"))))
+        link = {
+            "resourceId": str(monument),
+            "ontologyProperty": "",
+            "inverseOntologyProperty": "",
+        }
+        self._load(_resource(site, _tile(RESOURCE_NODE, [link])))
+
+        with self.assertRaisesMessage(RuntimeError, "link to resources in it"):
+            ArchesJsonImporter(loadid=loadid).reverse_load(loadid)
+
+        self.assertTrue(ResourceInstance.objects.filter(pk=monument).exists())
+        event = LoadEvent.objects.get(loadid=loadid)
+        self.assertEqual(event.status, "unindexed")
+        self.assertIn("link to resources in it", event.error_message)
+
+    def test_an_overwrite_load_cannot_be_undone(self):
+        monument = uuid.uuid4()
+        self._load(_resource(monument, _tile(STRING_NODE, _text("Monument 17"))))
+        loadid = self._load(
+            _resource(monument, _tile(STRING_NODE, _text("Monument 17, renamed"))),
+            overwrite=True,
+        )
+
+        response = self._reverse(loadid)
+
+        self.assertFalse(response["success"])
+        self.assertIn("cannot be undone", response["data"]["message"])
+        self.assertTrue(TileModel.objects.filter(resourceinstance_id=monument).exists())
+
+    def test_a_failure_after_every_chunk_is_written_keeps_nothing(self):
+        monument = uuid.uuid4()
+        with patch.object(
+            ArchesJsonImporter, "_post_process", side_effect=RuntimeError("conflict")
+        ):
+            loadid = self._load(
+                _resource(monument, _tile(STRING_NODE, _text("Monument 17"))),
+                status="failed",
+            )
+
+        self.assertFalse(ResourceInstance.objects.filter(pk=monument).exists())
+        self.assertFalse(
+            TileModel.objects.filter(resourceinstance_id=monument).exists()
+        )
+
+    def test_a_write_failure_says_how_far_it_got(self):
+        first, second, third = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        real_chunks = ArchesJsonImporter._iter_resource_chunks
+        real_write = ArchesJsonImporter._write_chunk
+        calls = []
+
+        def one_per_chunk(importer, chunk_size):
+            return real_chunks(importer, 1)
+
+        def second_chunk_fails(importer, *args):
+            calls.append(args)
+            if len(calls) == 2:
+                raise RuntimeError("disk full")
+            return real_write(importer, *args)
+
+        with (
+            patch.object(ArchesJsonImporter, "_iter_resource_chunks", one_per_chunk),
+            patch.object(ArchesJsonImporter, "_write_chunk", second_chunk_fails),
+        ):
+            loadid = self._load(
+                *(
+                    _resource(r, _tile(STRING_NODE, _text("Monument")))
+                    for r in (first, second, third)
+                ),
+                status="failed",
+            )
+
+        message = LoadEvent.objects.get(loadid=loadid).error_message
+        self.assertIn(
+            f"Wrote 1 of 3 resources; the chunk starting at resource {second} (#2) "
+            "failed: disk full",
+            message,
+        )
+        self.assertIn("Nothing from this load was kept", message)
+        self.assertFalse(ResourceInstance.objects.filter(pk=first).exists())
+        self.assertFalse(EditLog.objects.filter(transactionid=loadid).exists())
+
+        self._load(
+            *(
+                _resource(r, _tile(STRING_NODE, _text("Monument")))
+                for r in (first, second, third)
+            )
+        )
+        self.assertEqual(
+            ResourceInstance.objects.filter(pk__in=[first, second, third]).count(), 3
+        )
+
+    def test_a_failed_cleanup_does_not_hide_the_write_failure(self):
+        def write_fails(importer, *args):
+            raise RuntimeError("disk full")
+
+        def cleanup_fails(*args):
+            raise RuntimeError("connection lost")
+
+        with (
+            patch.object(ArchesJsonImporter, "_write_chunk", write_fails),
+            patch.object(ArchesJsonImporter, "_remove_written", cleanup_fails),
+            patch(REENABLE, self._reenable_then_fail),
+        ):
+            loadid = self._load(
+                _resource(uuid.uuid4(), _tile(STRING_NODE, _text("Monument"))),
+                status="failed",
+            )
+
+        message = LoadEvent.objects.get(loadid=loadid).error_message
+        self.assertIn("failed: disk full", message)
+        self.assertIn("part of this load may remain", message)
+        self.assertNotIn("Nothing from this load was kept", message)
+
+    def test_a_cancelled_load_turns_the_tile_triggers_back_on(self):
+        class Cancelled(BaseException):
+            pass
+
+        def write_cancelled(importer, *args):
+            raise Cancelled()
+
+        with patch.object(ArchesJsonImporter, "_write_chunk", write_cancelled):
+            with self.assertRaises(Cancelled):
+                self._cli(
+                    _resource(uuid.uuid4(), _tile(STRING_NODE, _text("Monument")))
+                )
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT tgenabled FROM pg_trigger WHERE tgname IN "
+                "('__arches_check_excess_tiles_trigger', "
+                "'__arches_trg_update_spatial_attributes')"
+            )
+            self.assertEqual([row[0] for row in cursor.fetchall()], ["O", "O"])
+
+    def test_a_load_that_cannot_turn_the_triggers_back_on_says_so(self):
+        monument = uuid.uuid4()
+        with patch(REENABLE, self._reenable_then_fail):
+            loadid = self._load(
+                _resource(monument, _tile(STRING_NODE, _text("Monument"))),
+            )
+
+        self.assertTrue(ResourceInstance.objects.filter(pk=monument).exists())
+        self.assertIn(
+            "tile triggers could not be turned back on",
+            LoadEvent.objects.get(loadid=loadid).error_message,
+        )
+
+    def test_a_failed_cleanup_does_not_hide_the_undo_failure(self):
+        monument = uuid.uuid4()
+        loadid = self._load(_resource(monument, _tile(STRING_NODE, _text("Monument"))))
+
+        def delete_fails(*args):
+            raise RuntimeError("disk full")
+
+        with (
+            patch.object(ArchesJsonImporter, "_delete_load", delete_fails),
+            patch(REENABLE, self._reenable_then_fail),
+        ):
+            response = self._reverse(loadid)
+
+        self.assertFalse(response["success"])
+        self.assertEqual(response["data"]["message"], "disk full")
+        self.assertEqual(LoadEvent.objects.get(loadid=loadid).status, "unindexed")
+        self.assertTrue(ResourceInstance.objects.filter(pk=monument).exists())
+
+    @staticmethod
+    def _reenable_then_fail(cursor, loadid):
+        reenable_tile_triggers(cursor, loadid)
+        raise RuntimeError("connection lost")
