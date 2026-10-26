@@ -24,7 +24,7 @@ class Command(BaseCommand):
             action="store_false",
             dest="index",
             default=True,
-            help="Write the data but skip indexing; reindex later with index_database",
+            help="Write the data but skip indexing; reindex later with es index_database",
         )
         parser.add_argument(
             "-mp",
@@ -80,7 +80,7 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS(_("Import finished.")))
             if not options["index"]:
                 self.stdout.write(
-                    _("Not indexed. Run: python manage.py index_database")
+                    _("Not indexed. Run: python manage.py es index_database")
                 )
             return
         raise CommandError(response.get("data", {}).get("message", _("Import failed.")))

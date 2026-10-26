@@ -67,14 +67,19 @@ python manage.py import_arches_json coral/pkg/business_data/all_business_data.js
 | `-mp`, `--use_multiprocessing` | off | Index across subprocesses after loading. |
 | `-mxp`, `--max_subprocesses` | `ceil(cpu_count()/2)` | Pool size for `-mp`. |
 
-`overwrite` deletes each incoming resource's existing instance before writing it
-(cascading to its tiles), and relaxes the pre-load checks accordingly: a unique
-constraint a resource violates against *itself* is not a clash, and cardinality
-is not checked against tiles that are about to be replaced. Left off, a
-resourceid that already exists is a validation failure.
+`overwrite` keeps each existing resource and replaces its tiles: tiles not in
+the file are deleted. It relaxes the pre-load checks accordingly: a unique
+constraint a resource violates against *itself* (or a resource it replaces) is
+not a clash, and cardinality is not checked against tiles that are about to be
+replaced. An overwrite that would move a resource to another graph is rejected.
+Left off, a resourceid, tileid or file id that already exists is a validation
+failure.
+
+If writing fails part way, a non-overwrite load removes everything it wrote;
+the load's error message says which resource the failing chunk started at.
 
 `--no-index` finishes the load with status `unindexed`: the tiles are durable
-but will not appear in search until you run `python manage.py index_database`.
+but will not appear in search until you run `python manage.py es index_database`.
 Useful when loading several files in a row — skip indexing on each and index
 once at the end:
 
@@ -82,7 +87,7 @@ once at the end:
 for f in part-*.jsonl; do
     python manage.py import_arches_json "$f" --no-index
 done
-python manage.py index_database
+python manage.py es index_database
 ```
 
 Indexing runs **once per load, not per resource**: tiles are written with the
@@ -107,13 +112,18 @@ whose prefork processes are daemonic, so a pool there raises "daemonic processes
 are not allowed to have children" and the load would finish written but never
 indexed. Use the command line when you want indexing fan-out.
 
-### Reversal
+### Undo
 
-The module is registered `reversible: False`. With overwrite on it deletes and
-re-creates resources, logging `create`/`tile create` edits — and
-`reverse_edit_log_entries` *deletes* on those, so a reverse would destroy the
-originals rather than restore them. Core's JSON-LD importer is registered the
-same way for the same reason.
+Loads are reversible (migration `0002`). **Undo import** deletes the resources
+the load created, in batches with the tile triggers off, then removes them from
+the search index. Stored files are kept. Undo is refused for an overwrite load
+(the tiles it replaced no longer exist), when any of the load's resources has
+been edited since, and when a resource outside the load links to one in it. It
+is checked again when the Celery task starts.
+
+On Arches 8.2.0a8 a refused undo does not raise an alert in the ETL manager;
+that alert is in core's `etl-manager.js` from 8.2.0a20. A refusal from the
+Celery task still arrives as a notification.
 
 ## Version coupling
 
