@@ -2,14 +2,42 @@
 {% load i18n %}
 
 {% block task_details %}
+<style>
+.arches-json-importer .r-select-icon { color: #000; }
+.arches-json-importer .upload-actions { text-align: center; padding: 1.5rem 2.5rem; }
+.arches-json-importer .upload-actions .dropzone-photo-upload { display: inline-flex; }
+.arches-json-importer .upload-actions .dropzone-photo-upload > .btn { border-top: 1px solid #c4c4c4; margin-bottom: 1.5rem; }
+.arches-json-importer .upload-actions #hidden-dz-previews { display: none; }
+.arches-json-importer .branch-xl-metadata-container > div { height: 100%; overflow: auto; padding: 1.5rem 2rem; }
+.arches-json-importer .branch-xl-metadata-container > div > section { margin-top: 2rem; }
+.arches-json-importer .branch-xl-metadata-container > div > section > h4 { margin-bottom: 0.8rem; }
+.arches-json-importer .file-summary > div + div,
+.arches-json-importer .file-list > div + div { margin-top: 0.4rem; }
+.arches-json-importer .file-summary > div > span:first-child,
+.arches-json-importer .file-list > div > span:first-child { display: inline-block; margin-right: 1rem; }
+.arches-json-importer .file-summary > div > span:first-child { min-width: 4rem; }
+.arches-json-importer .file-list { max-height: 26rem; overflow-y: auto; }
+.arches-json-importer .file-list > div > span:first-child { min-width: 20rem; }
+.arches-json-importer .file-list > .total { margin-top: 1rem; }
+.arches-json-importer .import-option { display: flex; align-items: baseline; gap: 0.8rem; }
+.arches-json-importer .import-option + .import-option { margin-top: 1.2rem; }
+.arches-json-importer .import-option input,
+.arches-json-importer .import-option label { margin: 0; }
+.arches-json-importer .import-option .text-warning { font-size: 1.5rem; }
+.arches-json-importer.loading-panel { flex-direction: row; align-items: center; justify-content: center; gap: 1rem; padding: 4rem; }
+.arches-json-importer.load-status { justify-content: flex-start; height: fit-content; margin-top: -0.5rem; }
+.arches-json-importer.etl-error-report > table { margin-top: 0.5rem; border: 1px solid rgba(0, 0, 0, 0.14); }
+.arches-json-importer.etl-error-report .details-toggle { text-align: right; vertical-align: top; }
+.arches-json-importer.etl-error-report .details-value { min-width: 8rem; }
+</style>
 <!-- ko ifnot: loading() -->
-<div class="branch-csv-etl">
+<div class="branch-csv-etl arches-json-importer">
     <!-- ko ifnot: response() -->
     <div class="file-select loader-select">
         <div data-bind="dropzone: dropzoneOptions">
             <div class="manifest-manager-main-menu-circle loader-button" aria-hidden="true">
                 <span>
-                    <i style="color: #000" class="fa fa-cloud-upload r-select-icon"></i>
+                    <i class="fa fa-cloud-upload r-select-icon"></i>
                 </span>
             </div>
             <h3>
@@ -21,17 +49,17 @@
             <h4>
                 <span data-bind="text: $root.translations.dragAndDropFilesOnPanel"></span>
             </h4>
-            <div style="display: flex; padding: 15px 25px; flex-direction: column; justify-content: center; align-items: center;">
-                <div style="display:flex; flex-direction: column;">
-                    <div class="dropzone-photo-upload" style="display:flex; margin-top: 0px;">
-                        <div style="border-top: 1px solid #c4c4c4; margin-bottom: 15px;" class="btn btn-primary btn-labeled btn-lg fa fa-file fileinput-button dz-clickable" data-bind="css: uniqueidClass" role="button">
+            <div class="upload-actions">
+                <div>
+                    <div class="dropzone-photo-upload">
+                        <div class="btn btn-primary btn-labeled btn-lg fa fa-file fileinput-button dz-clickable" data-bind="css: uniqueidClass" role="button">
                             <span data-bind="text: $root.translations.selectFile"></span>
                         </div>
-                        <div style="border-top: 1px solid #c4c4c4; margin-bottom: 15px;" class="btn btn-danger btn-labeled btn-lg fa fa-times-circle" data-bind="click: function() { $parent.cancel() }" role="button">
+                        <div class="btn btn-danger btn-labeled btn-lg fa fa-times-circle" data-bind="click: function() { $parent.cancel() }" role="button">
                             <span data-bind="text: $root.translations.cancelFileImport"></span>
                         </div>
-                        <div style="min-height: 100%;">
-                            <div id="hidden-dz-previews" style="display:none"></div>
+                        <div>
+                            <div id="hidden-dz-previews"></div>
                         </div>
                     </div>
                 </div>
@@ -45,56 +73,73 @@
 
     <!-- ko if: response() -->
     <div class="branch-xl-metadata-container">
-        <div style="display: grid; row-gap: 2px; height:100%; min-height:0; overflow:auto; padding:15px 20px;">
+        <div>
             <h3 class="branch-xl-title">
-                <span data-bind="text: $root.translations.format + ': {% trans 'Arches JSON' %}'"></span>
+                <span><span data-bind="text: $root.translations.format"></span>: {% trans "Arches JSON" %}</span>
             </h3>
-            <div class="etl-module-component" style="margin-top: 0px;">
+            <section>
                 <h4 class="branch-xl-title">
                     <span data-bind="text: $root.translations.fileUploadSummary"></span>
                 </h4>
-                <div style="display: inline-grid; grid-template-columns: auto auto; column-gap: 10px;">
-                    <div class="etl-loading-metadata-key">
-                        <span data-bind="text: $root.translations.file + ':'"></span>
+                <div class="file-summary">
+                    <div>
+                        <span class="etl-loading-metadata-key" data-bind="text: $root.translations.file + ':'"></span>
+                        <span class="etl-loading-metadata-value" data-bind="text: response().result.summary.name"></span>
                     </div>
-                    <div class="etl-loading-metadata-value" data-bind="text: response().result.summary.name"></div>
-                    <div class="etl-loading-metadata-key">
-                        <span data-bind="text: $root.translations.size + ':'"></span>
+                    <div>
+                        <span class="etl-loading-metadata-key" data-bind="text: $root.translations.size + ':'"></span>
+                        <span class="etl-loading-metadata-value" data-bind="text: response().result.summary.size"></span>
                     </div>
-                    <div class="etl-loading-metadata-value" data-bind="text: response().result.summary.size"></div>
                 </div>
-            </div>
+            </section>
 
-            <div class="branch-xl-file-contents-container" style="min-height:0;">
+            <section>
                 <h4 class="branch-xl-title">
                     <span data-bind="text: $root.translations.fileContents"></span>
                 </h4>
-                <div style="display: grid; grid-template-columns: 1fr auto; column-gap: 10px; max-height: 260px; overflow-y: auto;">
+                <div class="file-list">
                 <!--ko foreach: {data: Object.keys(response().result.summary.files), as: 'file'}-->
-                    <div class="etl-loading-metadata-value" data-bind="text: file"></div>
-                    <div class="etl-loading-metadata-key" data-bind="text: $parent.response().result.summary.files[file].size"></div>
+                    <div>
+                        <span class="etl-loading-metadata-value" data-bind="text: file"></span>
+                        <span class="etl-loading-metadata-key" data-bind="text: $parent.response().result.summary.files[file].size"></span>
+                    </div>
                 <!-- /ko -->
                 </div>
-            </div>
-
-            <div class="etl-module-component">
-                <label>
-                    <input type="checkbox" data-bind="checked: overwrite" />
-                    <span>{% trans "Overwrite resources that already exist" %}</span>
-                </label>
-                <label>
-                    <input type="checkbox" data-bind="checked: index" />
-                    <span>{% trans "Index the data after import" %}</span>
-                </label>
-                <!-- ko ifnot: index -->
-                <div class="etl-loading-metadata-key">{% trans "Data will be saved but not searchable until reindexed" %}</div>
+                <!-- ko if: response().result.summary.ignored_files -->
+                <div class="etl-loading-metadata-key">
+                    <span data-bind="text: response().result.summary.ignored_files"></span>
+                    {% trans "non-JSON files ignored. Files are not imported; copy them to storage first." %}
+                </div>
                 <!-- /ko -->
-            </div>
+            </section>
+
+            <section>
+                <h4 class="branch-xl-title">
+                    <span>{% trans "Options" %}</span>
+                </h4>
+                <div class="import-option">
+                    <input id="arches-json-overwrite" type="checkbox" data-bind="checked: overwrite">
+                    <div>
+                        <label for="arches-json-overwrite">{% trans "Overwrite existing resources" %}</label>
+                        <div class="text-warning" data-bind="visible: overwrite">{% trans "Each resource in the file completely replaces the existing one. Any of its tiles not in the file will be deleted. This process cannot be undone." %}</div>
+                        <div class="text-warning" data-bind="hidden: overwrite">{% trans "A resource that already exists will fail the load." %}</div>
+                    </div>
+                </div>
+                <div class="import-option">
+                    <input id="arches-json-index" type="checkbox" data-bind="checked: index">
+                    <div>
+                        <label for="arches-json-index">{% trans "Index the data after import" %}</label>
+                        <!-- ko ifnot: index -->
+                        <div class="text-warning">{% trans "Data will be saved but not searchable until reindexed" %}</div>
+                        <!-- /ko -->
+                    </div>
+                </div>
+            </section>
         </div>
     </div>
 
-    <div class="tabbed-workflow-footer, etl-module-footer">
-        <button class="btn btn-shim btn-labeled btn-lg fa fa-check btn-primary" style="margin-right: 8px;" data-bind="click: function(){ start(); }">
+    <div class="tabbed-workflow-footer etl-module-footer">
+        <button class="btn btn-shim btn-labeled btn-lg fa fa-check btn-primary" data-bind="click: function(){ start(); }">
             <span data-bind="text: $root.translations.submit"></span>
         </button>
         <button class="btn btn-shim btn-labeled btn-lg fa fa-times btn-danger" data-bind="click: function(){ response(null); }">
@@ -104,31 +149,36 @@
     <!-- /ko -->
 </div>
 <!--/ko-->
+<!-- ko if: loading() -->
+<div class="branch-csv-etl arches-json-importer loading-panel">
+    <i class="fa fa-spin fa-spinner fa-2x"></i>
+    <span data-bind="text: $root.translations.loadingData"></span>
+</div>
+<!-- /ko -->
 {% endblock task_details %}
 
 {% block etl_status %}
-<div class="branch-csv-etl" style="display: grid; row-gap: 2px; height:fit-content; margin-top: -5px;">
+<div class="branch-csv-etl arches-json-importer load-status">
     <h4 class="summary-title">
         <span>{% trans "Import Arches JSON Summary" %}</span>
     </h4>
     <!-- ko if: ko.unwrap(loadDetails) && ko.unwrap(loadDetails).summary -->
     <div class="branch-csv-etl-load-summmary">
-        <div style="display: inline-grid; grid-template-columns: auto auto; column-gap: 10px;">
-            <div class="summary-header">
-                <span data-bind="text: $root.translations.file"></span>
-            </div>
-            <div class="summary-header">
-                <span data-bind="text: $root.translations.size"></span>
+        <div class="file-list">
+            <div>
+                <span class="summary-header" data-bind="text: $root.translations.file"></span>
+                <span class="summary-header" data-bind="text: $root.translations.size"></span>
             </div>
             <!--ko foreach: {data: Object.keys(ko.unwrap(loadDetails).summary.files), as: 'file'}-->
-            <div class="etl-loading-metadata-value" data-bind="text: file"></div>
-            <div class="etl-loading-metadata-key" data-bind="text: ko.unwrap($parent.loadDetails).summary.files[file].size"></div>
-            <!-- /ko -->
-
-            <div class="summary-header" style="margin-top: 10px;">
-                <span>{% trans "Resources" %}</span>
+            <div>
+                <span class="etl-loading-metadata-value" data-bind="text: file"></span>
+                <span class="etl-loading-metadata-key" data-bind="text: ko.unwrap($parent.loadDetails).summary.files[file].size"></span>
             </div>
-            <div class="etl-loading-metadata-key" style="margin-top: 10px;" data-bind="text: ko.unwrap(loadDetails).summary.resources"></div>
+            <!-- /ko -->
+            <div class="total">
+                <span class="summary-header">{% trans "Resources" %}</span>
+                <span class="etl-loading-metadata-key" data-bind="text: ko.unwrap(loadDetails).summary.resources"></span>
+            </div>
         </div>
     </div>
     <!--/ko-->
@@ -137,11 +187,11 @@
 
 {% block etl_error_report %}
 <!-- ko if: validated -->
-<div class="etl-error-report">
+<div class="etl-error-report arches-json-importer">
     <h4 class="summary-header">
         <span data-bind="text: $root.translations.validationErrors"></span>
     </h4>
-    <table class="table table-striped" style="margin-top: 5px; border: 1px solid rgba(0,0,0,0.14)" width="100%">
+    <table class="table table-striped" width="100%">
         <thead>
             <tr>
                 <th>{% trans "Source" %}</th>
@@ -180,7 +230,7 @@
             </tr>
             <!-- ko if: $data.showDetails -->
             <tr>
-                <td style="text-align: right; vertical-align: top" data-bind="click: function(){ $data.showDetails(false); }">
+                <td class="details-toggle" data-bind="click: function(){ $data.showDetails(false); }">
                     <i class="fa fa-2xl fa-folder-open"></i>
                 </td>
                 <td colspan="5">
@@ -199,7 +249,7 @@
                             <!-- ko foreach: { data: $data.details, as: "details" } -->
                             <tr>
                                 <td data-bind="text: details.message"></td>
-                                <td style="min-width:80px" data-bind="text: details.value"></td>
+                                <td class="details-value" data-bind="text: details.value"></td>
                                 <td data-bind="text: details.source"></td>
                             </tr>
                             <!-- /ko -->
