@@ -112,7 +112,7 @@ def add_module(apps, schema_editor):
                 "celeryByteSizeLimit": 100000,
                 "logTileValues": False,
             },
-            "reversible": False,  # does not support un-overwriting a resource
+            "reversible": False,  # 0002 turns this on
             "slug": "arches-json-importer",
             "description": "Import Arches JSON business data in bulk",
             "helptemplate": "arches-json-importer-help",
